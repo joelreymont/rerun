@@ -12,8 +12,8 @@ use re_chunk_store::{
     ChunkStoreHandle, ChunkStoreSubscriber as _, GarbageCollectionOptions, GarbageCollectionTarget,
 };
 use re_log_types::{
-    AbsoluteTimeRange, AbsoluteTimeRangeF, ApplicationId, EntityPath, EntityPathHash, LogMsg,
-    RecordingId, SetStoreInfo, StoreId, StoreInfo, StoreKind, TimeType,
+    AbsoluteTimeRange, AbsoluteTimeRangeF, ApplicationId, EntityPath, EntityPathHash,
+    LogMsg, RecordingId, SetStoreInfo, StoreId, StoreInfo, StoreKind, TimeType,
 };
 use re_query::{
     QueryCache, QueryCacheHandle, StorageEngine, StorageEngineArcReadGuard, StorageEngineReadGuard,
@@ -554,16 +554,16 @@ impl EntityDb {
             }
 
             LogMsg::ArrowMsg(_, arrow_msg) => {
-                self.last_modified_at = web_time::Instant::now();
-
+                // Convert Arrow message to chunk
                 let chunk_batch = re_sorbet::ChunkBatch::try_from(&arrow_msg.batch)
                     .map_err(re_chunk::ChunkError::from)?;
                 let mut chunk = re_chunk::Chunk::from_chunk_batch(&chunk_batch)?;
                 chunk.sort_if_unsorted();
-                self.add_chunk_with_timestamp_metadata(
-                    &Arc::new(chunk),
-                    &chunk_batch.sorbet_schema().timestamps,
-                )?
+
+                let chunk = Arc::new(chunk);
+                let timestamps = chunk_batch.sorbet_schema().timestamps.clone();
+
+                self.add_chunk_with_timestamp_metadata(&chunk, &timestamps)?
             }
 
             LogMsg::BlueprintActivationCommand(_) => {
@@ -579,11 +579,13 @@ impl EntityDb {
         self.add_chunk_with_timestamp_metadata(chunk, &Default::default())
     }
 
-    fn add_chunk_with_timestamp_metadata(
+    pub fn add_chunk_with_timestamp_metadata(
         &mut self,
         chunk: &Arc<Chunk>,
         timestamps: &re_sorbet::TimestampMetadata,
     ) -> Result<Vec<ChunkStoreEvent>, Error> {
+        self.last_modified_at = web_time::Instant::now();
+
         let mut engine = self.storage_engine.write();
         let store_events = engine.store().insert_chunk(chunk)?;
         engine.cache().on_events(&store_events);
@@ -878,6 +880,7 @@ impl EntityDb {
         Ok(new_db)
     }
 }
+
 
 /// ## Stats
 impl EntityDb {

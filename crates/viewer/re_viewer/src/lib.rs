@@ -31,6 +31,9 @@ pub mod viewer_test_utils;
 #[cfg(not(target_arch = "wasm32"))]
 mod loading;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod ingestion_worker;
+
 /// Auto-generated blueprint-related types.
 ///
 /// They all implement the [`re_types_core::Component`] trait.

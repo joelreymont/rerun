@@ -8,7 +8,8 @@ use re_chunk::TimelineName;
 use re_data_source::{FileContents, LogDataSource};
 use re_entity_db::{InstancePath, entity_db::EntityDb};
 use re_log_types::{
-    ApplicationId, DataSourceMessage, FileSource, LogMsg, RecordingId, StoreId, StoreKind, TableMsg,
+    ApplicationId, DataSourceMessage, FileSource, LogMsg, RecordingId,
+    StoreId, StoreKind, TableMsg,
 };
 use re_redap_client::ConnectionRegistryHandle;
 use re_renderer::WgpuResourcePoolStatistics;
@@ -99,6 +100,9 @@ pub struct App {
 
     /// Interface for all recordings and blueprints
     pub(crate) store_hub: Option<StoreHub>,
+
+    #[cfg(not(target_arch = "wasm32"))]
+    ingestion_worker: crate::ingestion_worker::IngestionWorker,
 
     /// Notification panel.
     pub(crate) notifications: notifications::NotificationUi,
@@ -402,6 +406,8 @@ impl App {
                 blueprint_loader(),
                 &crate::app_blueprint::setup_welcome_screen_blueprint,
             )),
+            #[cfg(not(target_arch = "wasm32"))]
+            ingestion_worker: crate::ingestion_worker::IngestionWorker::new(),
             notifications: notifications::NotificationUi::new(creation_context.egui_ctx.clone()),
 
             memory_panel: Default::default(),
@@ -2117,6 +2123,9 @@ impl App {
             Err(_) => false,
         });
 
+        #[cfg(not(target_arch = "wasm32"))]
+        self.process_ingestion_worker_output(store_hub, egui_ctx);
+
         let start = web_time::Instant::now();
 
         while let Some((channel_source, msg)) = self.rx_log.try_recv() {
@@ -2142,7 +2151,7 @@ impl App {
 
             match msg {
                 DataSourceMessage::LogMsg(msg) => {
-                    self.receive_log_msg(&msg, store_hub, egui_ctx, &channel_source);
+                    self.receive_log_msg(&msg, store_hub, egui_ctx, channel_source.clone());
                 }
 
                 DataSourceMessage::UiCommand(ui_command) => {
@@ -2162,11 +2171,11 @@ impl App {
     }
 
     fn receive_log_msg(
-        &self,
+        &mut self,
         msg: &LogMsg,
         store_hub: &mut StoreHub,
         egui_ctx: &egui::Context,
-        channel_source: &SmartChannelSource,
+        channel_source: Arc<SmartChannelSource>,
     ) {
         let store_id = msg.store_id();
 
@@ -2180,14 +2189,56 @@ impl App {
         // Note that the `SetStoreInfo` message might be missing. It's not strictly necessary to add a new store.
         let msg_will_add_new_store = !store_hub.store_bundle().contains(store_id);
 
-        let entity_db = store_hub.entity_db_mut(store_id);
-        if entity_db.data_source.is_none() {
-            entity_db.data_source = Some((*channel_source).clone());
+        {
+            let entity_db = store_hub.entity_db_mut(store_id);
+            if entity_db.data_source.is_none() {
+                entity_db.data_source = Some((*channel_source).clone());
+            }
         }
 
-        let was_empty = entity_db.is_empty();
-        let entity_db_add_result = entity_db.add(msg);
+        // On native platforms, use the background ingestion worker for Arrow messages
+        #[cfg(not(target_arch = "wasm32"))]
+        if let LogMsg::ArrowMsg(_, arrow_msg) = msg {
+            self.ingestion_worker.submit_arrow_msg_blocking(
+                store_id.clone(),
+                arrow_msg.clone(),
+                channel_source,
+                msg_will_add_new_store,
+            );
+            return;
+        }
 
+        // For non-Arrow messages (or on WASM), process synchronously
+        let (was_empty, entity_db_add_result) = {
+            let entity_db = store_hub.entity_db_mut(store_id);
+            let was_empty = entity_db.is_empty();
+            let result = entity_db.add(msg);
+            (was_empty, result)
+        };
+
+        self.finalize_log_msg_processing(
+            store_hub,
+            egui_ctx,
+            channel_source.as_ref(),
+            store_id,
+            msg,
+            msg_will_add_new_store,
+            was_empty,
+            entity_db_add_result,
+        );
+    }
+
+    fn finalize_log_msg_processing(
+        &self,
+        store_hub: &mut StoreHub,
+        egui_ctx: &egui::Context,
+        channel_source: &SmartChannelSource,
+        store_id: &StoreId,
+        msg: &LogMsg,
+        msg_will_add_new_store: bool,
+        was_empty_before: bool,
+        entity_db_add_result: re_entity_db::Result<Vec<re_chunk_store::ChunkStoreEvent>>,
+    ) {
         // Downgrade to read-only, so we can access caches.
         let entity_db = store_hub
             .entity_db(store_id)
@@ -2207,7 +2258,7 @@ impl App {
             }
         }
 
-        if was_empty && !entity_db.is_empty() {
+        if was_empty_before && !entity_db.is_empty() {
             // Hack: we cannot go to a specific timeline or entity until we know about it.
             // Now we _hopefully_ do.
             if let SmartChannelSource::RedapGrpcStream { uri, .. } = channel_source {
@@ -2216,13 +2267,13 @@ impl App {
         }
 
         #[expect(clippy::match_same_arms)]
-        match &msg {
+        match msg {
             LogMsg::SetStoreInfo(_) => {
                 // Causes a new store typically. But that's handled below via `on_new_store`.
             }
 
             LogMsg::ArrowMsg(_, _) => {
-                // Handled by `EntityDb::add`.
+                // Handled during ingestion.
             }
 
             LogMsg::BlueprintActivationCommand(cmd) => match store_id.kind() {
@@ -2268,6 +2319,88 @@ impl App {
                     }
                 }
             },
+        }
+
+        // Handle any action that is triggered by a new store _after_ processing the message that caused it.
+        if msg_will_add_new_store {
+            self.on_new_store(egui_ctx, store_id, channel_source, store_hub);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn process_ingestion_worker_output(
+        &mut self,
+        store_hub: &mut StoreHub,
+        egui_ctx: &egui::Context,
+    ) {
+        re_tracing::profile_function!();
+
+        let processed_chunks = self.ingestion_worker.poll_processed_chunks();
+
+        for chunk_result in processed_chunks {
+            let crate::ingestion_worker::ProcessedChunk {
+                store_id,
+                chunk,
+                timestamps,
+                channel_source,
+                msg_will_add_new_store,
+            } = chunk_result;
+
+            let (was_empty, entity_db_add_result) = {
+                let entity_db = store_hub.entity_db_mut(&store_id);
+                let was_empty = entity_db.is_empty();
+                let result = entity_db.add_chunk_with_timestamp_metadata(&chunk, &timestamps);
+                (was_empty, result)
+            };
+
+            self.finalize_arrow_chunk_ingestion(
+                store_hub,
+                egui_ctx,
+                channel_source.as_ref(),
+                &store_id,
+                msg_will_add_new_store,
+                was_empty,
+                entity_db_add_result,
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn finalize_arrow_chunk_ingestion(
+        &self,
+        store_hub: &mut StoreHub,
+        egui_ctx: &egui::Context,
+        channel_source: &SmartChannelSource,
+        store_id: &StoreId,
+        msg_will_add_new_store: bool,
+        was_empty_before: bool,
+        entity_db_add_result: re_entity_db::Result<Vec<re_chunk_store::ChunkStoreEvent>>,
+    ) {
+        // Downgrade to read-only, so we can access caches.
+        let entity_db = store_hub
+            .entity_db(store_id)
+            .expect("Just queried it mutable and that was fine.");
+
+        match entity_db_add_result {
+            Ok(store_events) => {
+                if let Some(caches) = store_hub.active_caches() {
+                    caches.on_store_events(&store_events, entity_db);
+                }
+
+                self.validate_loaded_events(&store_events);
+            }
+
+            Err(err) => {
+                re_log::error_once!("Failed to add incoming chunk: {err}");
+            }
+        }
+
+        if was_empty_before && !entity_db.is_empty() {
+            // Hack: we cannot go to a specific timeline or entity until we know about it.
+            // Now we _hopefully_ do.
+            if let SmartChannelSource::RedapGrpcStream { uri, .. } = channel_source {
+                self.go_to_dataset_data(uri.store_id(), uri.fragment.clone());
+            }
         }
 
         // Handle any action that is triggered by a new store _after_ processing the message that caused it.
