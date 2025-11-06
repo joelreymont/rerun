@@ -114,6 +114,15 @@ pub struct EntityDb {
     storage_engine: StorageEngine,
 
     stats: IngestionStatistics,
+
+    /// Background worker for processing Arrow messages (native only).
+    ///
+    /// On native: Each EntityDb gets its own worker thread for parallel ingestion
+    /// On WASM: This is a no-op (messages processed synchronously)
+    ///
+    /// Lazily initialized on first Arrow message.
+    #[cfg(not(target_arch = "wasm32"))]
+    ingestion_worker: Option<crate::ingestion_worker::IngestionWorker>,
 }
 
 impl Debug for EntityDb {
@@ -151,6 +160,8 @@ impl EntityDb {
             time_histogram_per_timeline: Default::default(),
             storage_engine,
             stats: IngestionStatistics::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            ingestion_worker: None,
         }
     }
 
@@ -629,6 +640,69 @@ impl EntityDb {
 
     pub fn set_store_info(&mut self, store_info: SetStoreInfo) {
         self.set_store_info = Some(store_info);
+    }
+
+    /// Submit an Arrow message to the background ingestion worker (native only).
+    ///
+    /// On native: Lazily creates worker on first call, then queues message for processing
+    /// On WASM: This method doesn't exist (compile error if called)
+    ///
+    /// The caller should periodically call [`Self::poll_worker_output`] to retrieve
+    /// processed chunks and add them to the store.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn submit_arrow_msg(
+        &mut self,
+        arrow_msg: re_log_types::ArrowMsg,
+        channel_source: Arc<re_smart_channel::SmartChannelSource>,
+        msg_will_add_new_store: bool,
+    ) {
+        re_tracing::profile_function!();
+
+        // Lazy-init worker on first use
+        if self.ingestion_worker.is_none() {
+            re_log::debug!("Creating ingestion worker for store {}", self.store_id);
+            self.ingestion_worker = Some(crate::ingestion_worker::IngestionWorker::new());
+        }
+
+        if let Some(worker) = &self.ingestion_worker {
+            worker.submit_arrow_msg_blocking(
+                self.store_id.clone(),
+                arrow_msg,
+                channel_source,
+                msg_will_add_new_store,
+            );
+        }
+    }
+
+    /// Poll the background ingestion worker for processed chunks (native only).
+    ///
+    /// Returns a vector of (ProcessedChunk, StoreEvents) pairs.
+    /// Each chunk has been successfully added to the store.
+    ///
+    /// On native: Returns chunks processed by the background worker
+    /// On WASM: This method doesn't exist (compile error if called)
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn poll_worker_output(
+        &mut self,
+    ) -> Vec<(crate::ingestion_worker::ProcessedChunk, Result<Vec<ChunkStoreEvent>, Error>)> {
+        re_tracing::profile_function!();
+
+        let Some(worker) = &self.ingestion_worker else {
+            return Vec::new();
+        };
+
+        let processed_chunks = worker.poll_processed_chunks();
+        let mut results = Vec::with_capacity(processed_chunks.len());
+
+        for processed in processed_chunks {
+            let result = self.add_chunk_with_timestamp_metadata(
+                &processed.chunk,
+                &processed.timestamps,
+            );
+            results.push((processed, result));
+        }
+
+        results
     }
 
     /// Free up some RAM by forgetting the older parts of all timelines.

@@ -101,9 +101,6 @@ pub struct App {
     /// Interface for all recordings and blueprints
     pub(crate) store_hub: Option<StoreHub>,
 
-    #[cfg(not(target_arch = "wasm32"))]
-    ingestion_worker: crate::ingestion_worker::IngestionWorker,
-
     /// Notification panel.
     pub(crate) notifications: notifications::NotificationUi,
 
@@ -406,8 +403,6 @@ impl App {
                 blueprint_loader(),
                 &crate::app_blueprint::setup_welcome_screen_blueprint,
             )),
-            #[cfg(not(target_arch = "wasm32"))]
-            ingestion_worker: crate::ingestion_worker::IngestionWorker::new(),
             notifications: notifications::NotificationUi::new(creation_context.egui_ctx.clone()),
 
             memory_panel: Default::default(),
@@ -2196,15 +2191,11 @@ impl App {
             }
         }
 
-        // On native platforms, use the background ingestion worker for Arrow messages
+        // On native platforms, use the EntityDb's ingestion worker for Arrow messages
         #[cfg(not(target_arch = "wasm32"))]
         if let LogMsg::ArrowMsg(_, arrow_msg) = msg {
-            self.ingestion_worker.submit_arrow_msg_blocking(
-                store_id.clone(),
-                arrow_msg.clone(),
-                channel_source,
-                msg_will_add_new_store,
-            );
+            let entity_db = store_hub.entity_db_mut(store_id);
+            entity_db.submit_arrow_msg(arrow_msg.clone(), channel_source, msg_will_add_new_store);
             return;
         }
 
@@ -2335,33 +2326,38 @@ impl App {
     ) {
         re_tracing::profile_function!();
 
-        let processed_chunks = self.ingestion_worker.poll_processed_chunks();
+        // Collect store IDs first to avoid borrowing issues
+        let store_ids: Vec<StoreId> = store_hub
+            .store_bundle()
+            .all_stores()
+            .map(|store| store.store_id().clone())
+            .collect();
 
-        for chunk_result in processed_chunks {
-            let crate::ingestion_worker::ProcessedChunk {
-                store_id,
-                chunk,
-                timestamps,
-                channel_source,
-                msg_will_add_new_store,
-            } = chunk_result;
-
-            let (was_empty, entity_db_add_result) = {
+        // Poll each EntityDb's worker for processed chunks
+        for store_id in store_ids {
+            let results = {
                 let entity_db = store_hub.entity_db_mut(&store_id);
-                let was_empty = entity_db.is_empty();
-                let result = entity_db.add_chunk_with_timestamp_metadata(&chunk, &timestamps);
-                (was_empty, result)
+                entity_db.poll_worker_output()
             };
 
-            self.finalize_arrow_chunk_ingestion(
-                store_hub,
-                egui_ctx,
-                channel_source.as_ref(),
-                &store_id,
-                msg_will_add_new_store,
-                was_empty,
-                entity_db_add_result,
-            );
+            for (processed, entity_db_add_result) in results {
+                let was_empty_before = {
+                    let entity_db = store_hub.entity_db(&store_id).unwrap();
+                    // The chunk was just added, so check if it was previously empty
+                    // by checking if this was the only chunk
+                    entity_db.num_rows() == processed.chunk.num_rows()
+                };
+
+                self.finalize_arrow_chunk_ingestion(
+                    store_hub,
+                    egui_ctx,
+                    processed.channel_source.as_ref(),
+                    &processed.store_id,
+                    processed.msg_will_add_new_store,
+                    was_empty_before,
+                    entity_db_add_result,
+                );
+            }
         }
     }
 
