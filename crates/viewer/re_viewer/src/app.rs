@@ -2329,8 +2329,8 @@ impl App {
         // Collect store IDs first to avoid borrowing issues
         let store_ids: Vec<StoreId> = store_hub
             .store_bundle()
-            .all_stores()
-            .map(|store| store.store_id().clone())
+            .entity_dbs()
+            .map(|entity_db| entity_db.store_id().clone())
             .collect();
 
         // Poll each EntityDb's worker for processed chunks
@@ -2340,14 +2340,7 @@ impl App {
                 entity_db.poll_worker_output()
             };
 
-            for (processed, entity_db_add_result) in results {
-                let was_empty_before = {
-                    let entity_db = store_hub.entity_db(&store_id).unwrap();
-                    // The chunk was just added, so check if it was previously empty
-                    // by checking if this was the only chunk
-                    entity_db.num_rows() == processed.chunk.num_rows()
-                };
-
+            for (processed, was_empty_before, entity_db_add_result) in results {
                 self.finalize_arrow_chunk_ingestion(
                     store_hub,
                     egui_ctx,

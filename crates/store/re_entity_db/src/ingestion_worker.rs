@@ -162,7 +162,7 @@ mod native_impl {
         /// This is the work that we want to do off the main thread.
         fn process_arrow_msg(
             arrow_msg: &ArrowMsg,
-        ) -> re_entity_db::Result<(re_chunk::Chunk, re_sorbet::TimestampMetadata)> {
+        ) -> crate::Result<(re_chunk::Chunk, re_sorbet::TimestampMetadata)> {
             re_tracing::profile_function!();
 
             let chunk_batch = re_sorbet::ChunkBatch::try_from(&arrow_msg.batch)
