@@ -161,19 +161,16 @@ struct ViewQueryCacheEntry {
 #[derive(Clone, PartialEq, Eq)]
 struct ViewQueryCacheKey {
     recording_generation: re_chunk_store::ChunkStoreGeneration,
-    blueprint_generation: re_chunk_store::ChunkStoreGeneration,
     blueprint_query: LatestAtQuery,
 }
 
 impl ViewQueryCacheKey {
     fn new(
         recording_generation: re_chunk_store::ChunkStoreGeneration,
-        blueprint_generation: re_chunk_store::ChunkStoreGeneration,
         blueprint_query: &LatestAtQuery,
     ) -> Self {
         Self {
             recording_generation,
-            blueprint_generation,
             blueprint_query: blueprint_query.clone(),
         }
     }
@@ -187,19 +184,16 @@ struct VisualizableEntitiesCacheEntry {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct VisualizableEntitiesCacheKey {
     recording_generation: re_chunk_store::ChunkStoreGeneration,
-    blueprint_generation: re_chunk_store::ChunkStoreGeneration,
     space_origin: EntityPath,
 }
 
 impl VisualizableEntitiesCacheKey {
     fn new(
         recording_generation: re_chunk_store::ChunkStoreGeneration,
-        blueprint_generation: re_chunk_store::ChunkStoreGeneration,
         space_origin: &EntityPath,
     ) -> Self {
         Self {
             recording_generation,
-            blueprint_generation,
             space_origin: space_origin.clone(),
         }
     }
@@ -355,7 +349,6 @@ impl AppState {
                 let indicated_entities_per_visualizer =
                     view_class_registry.indicated_entities_per_visualizer(recording.store_id());
                 let recording_generation = recording.generation();
-                let blueprint_generation = store_context.blueprint.generation();
 
                 self.view_query_cache
                     .retain(|view_id, _| viewport_ui.blueprint.views.contains_key(view_id));
@@ -372,33 +365,35 @@ impl AppState {
                         .map(|view| {
                             let cache_key = VisualizableEntitiesCacheKey::new(
                                 recording_generation.clone(),
-                                blueprint_generation.clone(),
                                 &view.space_origin,
                             );
 
                             let visualizable_entities = if let Some(entry) = self.visualizable_entities_cache.get(&view.id)
                                 && entry.key == cache_key
                             {
+                                // Cache hit - reuse cached result
                                 PerVisualizer(entry.result.0.clone())
                             } else {
-                                // This is the expensive operation we're caching
-                                view.class(view_class_registry)
+                                // Cache miss - compute and cache the expensive operation
+                                let computed = view.class(view_class_registry)
                                     .determine_visualizable_entities(
                                         &maybe_visualizable_entities_per_visualizer,
                                         recording,
                                         &view_class_registry
                                             .new_visualizer_collection(view.class_identifier()),
                                         &view.space_origin,
-                                    )
-                            };
+                                    );
 
-                            self.visualizable_entities_cache.insert(
-                                view.id,
-                                VisualizableEntitiesCacheEntry {
-                                    key: cache_key,
-                                    result: PerVisualizer(visualizable_entities.0.clone()),
-                                },
-                            );
+                                self.visualizable_entities_cache.insert(
+                                    view.id,
+                                    VisualizableEntitiesCacheEntry {
+                                        key: cache_key,
+                                        result: PerVisualizer(computed.0.clone()),
+                                    },
+                                );
+
+                                computed
+                            };
 
                             (view.id, visualizable_entities)
                         })
@@ -417,30 +412,33 @@ impl AppState {
 
                             let cache_key = ViewQueryCacheKey::new(
                                 recording_generation.clone(),
-                                blueprint_generation.clone(),
                                 &blueprint_query,
                             );
 
                             let result = if let Some(entry) = self.view_query_cache.get(&view.id)
                                 && entry.key == cache_key
                             {
+                                // Cache hit - reuse BASE query results (before overrides)
                                 entry.result.clone()
                             } else {
-                                view.contents.execute_query(
+                                // Cache miss - execute query and cache BASE results (before overrides)
+                                let query_result = view.contents.execute_query(
                                     store_context,
                                     view_class_registry,
                                     &blueprint_query,
                                     visualizable_entities,
-                                )
-                            };
+                                );
 
-                            self.view_query_cache.insert(
-                                view.id,
-                                ViewQueryCacheEntry {
-                                    key: cache_key,
-                                    result: result.clone(),
-                                },
-                            );
+                                self.view_query_cache.insert(
+                                    view.id,
+                                    ViewQueryCacheEntry {
+                                        key: cache_key,
+                                        result: query_result.clone(),
+                                    },
+                                );
+
+                                query_result
+                            };
 
                             (view.id, result)
                         })
@@ -502,6 +500,9 @@ impl AppState {
                 // Update the viewport. May spawn new views and handle queued requests (like screenshots).
                 viewport_ui.on_frame_start(&ctx);
 
+                // Apply blueprint property overrides to the BASE query results.
+                // Note: The cache contains BASE results (before overrides), so we always
+                // need to run this step to get the final results with overrides applied.
                 let query_results = update_overrides(
                     store_context,
                     query_results,
@@ -514,12 +515,6 @@ impl AppState {
                     &visualizable_entities_per_view,
                     view_states,
                 );
-
-                for (view_id, result) in &query_results {
-                    if let Some(entry) = self.view_query_cache.get_mut(view_id) {
-                        entry.result = result.clone();
-                    }
-                }
 
                 // We need to recreate the context to appease the borrow checker. It is a bit annoying, but
                 // it's just a bunch of refs so not really that big of a deal in practice.
