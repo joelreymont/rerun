@@ -826,7 +826,12 @@ impl ViewportBlueprint {
 
     /// Save the current state of the viewport to the blueprint store.
     /// This should only be called if the tree was edited.
-    pub fn save_tree_as_containers(&self, ctx: &ViewerContext<'_>) {
+    ///
+    /// Returns the updated container map that should be assigned to `self.containers`.
+    pub fn save_tree_as_containers(
+        &self,
+        ctx: &ViewerContext<'_>,
+    ) -> BTreeMap<ContainerId, ContainerBlueprint> {
         re_tracing::profile_function!();
 
         re_log::trace!("Saving tree: {:#?}", self.tree);
@@ -890,6 +895,9 @@ impl ViewportBlueprint {
             }
         }
 
+        // Build the new container map from the tree
+        let mut container_blueprints = BTreeMap::new();
+
         // Now save any contents that are a container back to the blueprint
         for (tile_id, contents) in &contents_from_tile_id {
             if let Contents::Container(container_id) = contents
@@ -906,6 +914,7 @@ impl ViewportBlueprint {
                 );
 
                 blueprint.save_to_blueprint_store(ctx);
+                container_blueprints.insert(*container_id, blueprint);
             }
         }
 
@@ -930,6 +939,8 @@ impl ViewportBlueprint {
                 blueprint_archetypes::ViewportBlueprint::descriptor_root_container(),
             );
         }
+
+        container_blueprints
     }
 
     /// Process any deferred [`ViewportCommand`] and then save to blueprint store (if needed).
@@ -960,7 +971,8 @@ impl ViewportBlueprint {
         // TODO(emilk): consider diffing the tree against the state it was in at the start of the frame,
         // so that we only save it if it actually changed.
 
-        self.save_tree_as_containers(ctx);
+        // Save the tree to the blueprint store and update the in-memory containers map
+        self.containers = self.save_tree_as_containers(ctx);
     }
 }
 
