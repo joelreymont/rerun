@@ -256,7 +256,7 @@ impl RrdLoadingMetrics {
             )
         } else if self.is_tracking {
             format!(
-                "Loading... {} received, {} ingested",
+                "Loading… {} received, {} ingested",
                 self.total_messages, self.total_ingested
             )
         } else {

@@ -117,7 +117,7 @@ pub struct EntityDb {
     /// Background worker for processing Arrow messages (native only).
     ///
     /// On native: Each `EntityDb` gets its own worker thread for parallel ingestion
-    /// On WASM: This is a no-op (messages processed synchronously)
+    /// On Wasm: This is a no-op (messages processed synchronously)
     ///
     /// Lazily initialized on first Arrow message.
     #[cfg(not(target_arch = "wasm32"))]
@@ -666,7 +666,7 @@ impl EntityDb {
     /// Submit an Arrow message to the background ingestion worker (native only).
     ///
     /// On native: Lazily creates worker on first call, then queues message for processing
-    /// On WASM: This method doesn't exist (compile error if called)
+    /// On Wasm: This method doesn't exist (compile error if called)
     ///
     /// The caller should periodically call [`Self::poll_worker_output`] to retrieve
     /// processed chunks and add them to the store.
@@ -701,7 +701,7 @@ impl EntityDb {
     /// Each chunk has been successfully added to the store.
     ///
     /// On native: Returns chunks processed by the background worker
-    /// On WASM: This method doesn't exist (compile error if called)
+    /// On Wasm: This method doesn't exist (compile error if called)
     #[cfg(not(target_arch = "wasm32"))]
     pub fn poll_worker_output(
         &mut self,

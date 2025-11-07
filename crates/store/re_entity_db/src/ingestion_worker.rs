@@ -3,7 +3,7 @@
 /// # Platform Support
 ///
 /// - **Native**: Uses a dedicated background thread with bounded channels for backpressure
-/// - **WASM**: Processes synchronously (no threads available)
+/// - **Wasm**: Processes synchronously (no threads available)
 ///
 /// # Architecture
 ///
@@ -96,8 +96,8 @@ mod native_impl {
             };
 
             // Block until we can send
-            if let Err(e) = self.input_tx.send(work_item) {
-                re_log::warn!("Failed to send to ingestion worker: {e}");
+            if let Err(err) = self.input_tx.send(work_item) {
+                re_log::warn!("Failed to send to ingestion worker: {err}");
             }
         }
 
@@ -185,7 +185,7 @@ mod native_impl {
 }
 
 // ============================================================================
-// WASM IMPLEMENTATION (synchronous processing, no threads)
+// Wasm IMPLEMENTATION (synchronous processing, no threads)
 // ============================================================================
 
 #[cfg(target_arch = "wasm32")]
@@ -197,18 +197,18 @@ mod wasm_impl {
 
     use super::ProcessedChunk;
 
-    /// WASM implementation that processes synchronously.
+    /// Wasm implementation that processes synchronously.
     ///
-    /// Since WASM doesn't support threads, we process messages immediately
+    /// Since Wasm doesn't support threads, we process messages immediately
     /// instead of queueing them to a background worker.
     pub struct IngestionWorkerImpl {
-        // WASM implementation has no state, but we keep the struct
+        // Wasm implementation has no state, but we keep the struct
         // for API compatibility
         _phantom: std::marker::PhantomData<()>,
     }
 
     impl IngestionWorkerImpl {
-        /// Create a new synchronous ingestion worker (WASM).
+        /// Create a new synchronous ingestion worker (Wasm).
         pub fn new() -> Self {
             Self {
                 _phantom: std::marker::PhantomData,
@@ -226,16 +226,16 @@ mod wasm_impl {
             _channel_source: Arc<SmartChannelSource>,
             _msg_will_add_new_store: bool,
         ) {
-            // On WASM, we don't queue messages - they should be processed synchronously
+            // On Wasm, we don't queue messages - they should be processed synchronously
             // by the caller instead of using the worker.
             re_log::warn_once!(
-                "IngestionWorker::submit_arrow_msg_blocking called on WASM - this is unexpected"
+                "IngestionWorker::submit_arrow_msg_blocking called on Wasm - this is unexpected"
             );
         }
 
-        /// Poll for processed chunks (always empty on WASM).
+        /// Poll for processed chunks (always empty on Wasm).
         pub fn poll_processed_chunks(&self) -> Vec<ProcessedChunk> {
-            // On WASM, messages are processed synchronously, so polling always returns empty
+            // On Wasm, messages are processed synchronously, so polling always returns empty
             Vec::new()
         }
     }
@@ -248,7 +248,7 @@ mod wasm_impl {
 /// Platform-agnostic ingestion worker.
 ///
 /// On native: Uses background thread with channels
-/// On WASM: No-op (messages processed synchronously by caller)
+/// On Wasm: No-op (messages processed synchronously by caller)
 pub struct IngestionWorker {
     #[cfg(not(target_arch = "wasm32"))]
     inner: native_impl::IngestionWorkerImpl,
@@ -261,7 +261,7 @@ impl IngestionWorker {
     /// Create a new ingestion worker.
     ///
     /// - On native: Spawns a background thread
-    /// - On WASM: Returns a no-op worker
+    /// - On Wasm: Returns a no-op worker
     pub fn new() -> Self {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -281,7 +281,7 @@ impl IngestionWorker {
     /// Submit an arrow message for processing.
     ///
     /// - On native: Queues to background thread (may block if queue is full)
-    /// - On WASM: No-op (caller should process synchronously instead)
+    /// - On Wasm: No-op (caller should process synchronously instead)
     pub fn submit_arrow_msg_blocking(
         &self,
         store_id: StoreId,
@@ -300,7 +300,7 @@ impl IngestionWorker {
     /// Poll for processed chunks without blocking.
     ///
     /// - On native: Returns chunks processed by background thread
-    /// - On WASM: Always returns empty vec (messages processed synchronously)
+    /// - On Wasm: Always returns empty vec (messages processed synchronously)
     pub fn poll_processed_chunks(&self) -> Vec<ProcessedChunk> {
         self.inner.poll_processed_chunks()
     }
@@ -313,7 +313,7 @@ impl Default for IngestionWorker {
 }
 
 // ============================================================================
-// TESTS (native only, since WASM worker is a no-op)
+// TESTS (native only, since Wasm worker is a no-op)
 // ============================================================================
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -331,19 +331,24 @@ mod tests {
 
     /// Helper to create a test arrow message
     fn create_test_arrow_msg(index: usize) -> ArrowMsg {
+        let index_i64 = i64::try_from(index).expect("test index should fit in i64");
         let chunk = Chunk::builder(entity_path!("test", "points", index.to_string()))
             .with_archetype(
                 RowId::new(),
                 TimePoint::default().with(
                     Timeline::new_sequence("seq"),
-                    TimeInt::from_millis(NonMinI64::new(index as i64).unwrap()),
+                    TimeInt::from_millis(
+                        NonMinI64::new(index_i64).expect("test index should not be i64::MIN"),
+                    ),
                 ),
                 &Points2D::new([(index as f32, index as f32)]),
             )
             .build()
-            .unwrap();
+            .expect("test chunk should build successfully");
 
-        chunk.to_arrow_msg().unwrap()
+        chunk
+            .to_arrow_msg()
+            .expect("test chunk should convert to arrow msg")
     }
 
     #[test]
@@ -443,17 +448,20 @@ mod tests {
         let channel_source_clone = channel_source.clone();
 
         // Submit in a separate thread to avoid blocking test
-        let submit_handle = std::thread::spawn(move || {
-            for i in 0..NUM_MESSAGES {
-                let arrow_msg = create_test_arrow_msg(i);
-                worker_ref.submit_arrow_msg_blocking(
-                    store_id_clone.clone(),
-                    arrow_msg,
-                    channel_source_clone.clone(),
-                    false,
-                );
-            }
-        });
+        let submit_handle = std::thread::Builder::new()
+            .name("test-backpressure-submitter".to_owned())
+            .spawn(move || {
+                for i in 0..NUM_MESSAGES {
+                    let arrow_msg = create_test_arrow_msg(i);
+                    worker_ref.submit_arrow_msg_blocking(
+                        store_id_clone.clone(),
+                        arrow_msg,
+                        channel_source_clone.clone(),
+                        false,
+                    );
+                }
+            })
+            .expect("failed to spawn test thread");
 
         // Poll periodically to drain the queue
         let mut total_chunks = 0;
@@ -490,7 +498,10 @@ mod tests {
         });
 
         // Create an invalid arrow message (empty batch with incorrect schema)
-        let schema = arrow::datatypes::Schema::new(vec![] as Vec<arrow::datatypes::Field>);
+        let schema = arrow::datatypes::Schema::new_with_metadata(
+            vec![] as Vec<arrow::datatypes::Field>,
+            Default::default(),
+        );
         let batch = arrow::array::RecordBatch::new_empty(Arc::new(schema));
         let invalid_msg = ArrowMsg {
             chunk_id: *re_chunk::ChunkId::new(),
@@ -538,21 +549,24 @@ mod tests {
         let store_id_submit = store_id.clone();
         let channel_source_submit = channel_source.clone();
 
-        let submit_handle = std::thread::spawn(move || {
-            for i in 0..NUM_MESSAGES {
-                let arrow_msg = create_test_arrow_msg(i);
-                worker_submit.submit_arrow_msg_blocking(
-                    store_id_submit.clone(),
-                    arrow_msg,
-                    channel_source_submit.clone(),
-                    false,
-                );
-                // Small delay to simulate realistic submission pattern
-                if i % 50 == 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+        let submit_handle = std::thread::Builder::new()
+            .name("test-concurrent-submitter".to_owned())
+            .spawn(move || {
+                for i in 0..NUM_MESSAGES {
+                    let arrow_msg = create_test_arrow_msg(i);
+                    worker_submit.submit_arrow_msg_blocking(
+                        store_id_submit.clone(),
+                        arrow_msg,
+                        channel_source_submit.clone(),
+                        false,
+                    );
+                    // Small delay to simulate realistic submission pattern
+                    if i % 50 == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
-            }
-        });
+            })
+            .expect("failed to spawn test thread");
 
         // Poll concurrently from main thread
         let mut total_chunks = 0;

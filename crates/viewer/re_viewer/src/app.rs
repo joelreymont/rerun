@@ -1350,7 +1350,7 @@ impl App {
             Err(err) => {
                 re_log::error!("Failed to open data source: {}", re_error::format(err));
 
-                // Reset tracking state on failure to prevent UI from showing stuck "Loading..." state
+                // Reset tracking state on failure to prevent UI from showing stuck "Loading…" state
                 #[cfg(not(target_arch = "wasm32"))]
                 self.rrd_loading_metrics.reset();
             }
@@ -2045,8 +2045,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.strong("Status:");
                         ui.label(
-                            egui::RichText::new("✅ Complete")
-                                .color(tokens.success_text_color),
+                            egui::RichText::new("✅ Complete").color(tokens.success_text_color),
                         );
                     });
                 } else if self.rrd_loading_metrics.all_messages_ingested.is_some() {
@@ -2061,8 +2060,7 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.strong("Status:");
                         ui.label(
-                            egui::RichText::new("⏳ Loading...")
-                                .color(tokens.alert_warning.icon),
+                            egui::RichText::new("⏳ Loading…").color(tokens.alert_warning.icon),
                         );
                     });
                 }
@@ -2293,8 +2291,7 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let color_rect =
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
+                let color_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
                 ui.painter().rect_filled(color_rect, 2.0, opening_color);
                 ui.add_space(14.0);
                 ui.small("Opening");
@@ -2302,8 +2299,7 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let color_rect =
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
+                let color_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
                 ui.painter().rect_filled(color_rect, 2.0, ingesting_color);
                 ui.add_space(14.0);
                 ui.small("Ingesting");
@@ -2311,8 +2307,7 @@ impl App {
 
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let color_rect =
-                    egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
+                let color_rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(12.0, 12.0));
                 ui.painter().rect_filled(color_rect, 2.0, playing_color);
                 ui.add_space(14.0);
                 ui.small("Playing");
@@ -2582,7 +2577,7 @@ impl App {
                 && !CHANNELS_CLOSED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 re_log::info!(
-                    "📡 All data source channels closed. Waiting for worker to finish ingesting {} messages...",
+                    "📡 All data source channels closed. Waiting for worker to finish ingesting {} messages…",
                     self.rrd_loading_metrics.total_messages
                 );
             }
@@ -2645,7 +2640,7 @@ impl App {
             return;
         }
 
-        // For non-Arrow messages (or on WASM), process synchronously
+        // For non-Arrow messages (or on Wasm), process synchronously
         let (was_empty, entity_db_add_result) = {
             let entity_db = store_hub.entity_db_mut(store_id);
             let was_empty = entity_db.is_empty();
@@ -2771,7 +2766,11 @@ impl App {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn process_ingestion_worker_output(&mut self, store_hub: &mut StoreHub, egui_ctx: &egui::Context) {
+    fn process_ingestion_worker_output(
+        &mut self,
+        store_hub: &mut StoreHub,
+        egui_ctx: &egui::Context,
+    ) {
         re_tracing::profile_function!();
 
         // Debug: Log every time this function is called
