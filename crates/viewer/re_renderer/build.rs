@@ -15,9 +15,11 @@
 #![allow(clippy::allow_attributes, clippy::disallowed_types)] // False positives for using files on Wasm
 #![expect(clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail, ensure};
+use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
 
 use re_build_tools::{
@@ -119,6 +121,62 @@ fn should_run(environment: Environment) -> bool {
     }
 }
 
+/// Compute SHA-256 hash of a file's contents
+fn compute_file_hash(path: &Path) -> anyhow::Result<String> {
+    let content = std::fs::read(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let hash = Sha256::digest(&content);
+    Ok(format!("{hash:x}"))
+}
+
+/// Load the shader manifest from target directory (persistent across incremental builds)
+fn load_shader_manifest(manifest_dir: &Path) -> BTreeMap<PathBuf, String> {
+    let manifest_path = manifest_dir.join("shader_manifest.json");
+    if let Ok(content) = std::fs::read_to_string(&manifest_path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        BTreeMap::new()
+    }
+}
+
+/// Save the shader manifest to target directory (persistent across incremental builds)
+fn save_shader_manifest(manifest_dir: &Path, manifest: &BTreeMap<PathBuf, String>) -> anyhow::Result<()> {
+    std::fs::create_dir_all(manifest_dir)?;
+    let manifest_path = manifest_dir.join("shader_manifest.json");
+    let content = serde_json::to_string_pretty(manifest)?;
+    std::fs::write(&manifest_path, content)?;
+    Ok(())
+}
+
+/// Check if shaders need to be rebuilt by comparing current hashes with cached manifest
+fn should_rebuild_shaders(
+    entries: &[DirEntry],
+    shader_dir: &Path,
+    manifest_dir: &Path,
+) -> anyhow::Result<bool> {
+    let previous_manifest = load_shader_manifest(manifest_dir);
+
+    // Build current manifest
+    let mut current_manifest = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path();
+        let relative_path = path.strip_prefix(shader_dir)
+            .unwrap_or(path)
+            .to_path_buf();
+        let hash = compute_file_hash(path)?;
+        current_manifest.insert(relative_path, hash);
+    }
+
+    // Compare manifests
+    if current_manifest != previous_manifest {
+        // Save new manifest
+        save_shader_manifest(manifest_dir, &current_manifest)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn main() {
     let environment = Environment::detect();
     let is_release = cfg!(not(debug_assertions)); // This works
@@ -189,7 +247,7 @@ pub fn init() {
 "#
     .to_owned();
 
-    let walker = WalkDir::new(shader_dir).into_iter();
+    let walker = WalkDir::new(&shader_dir).into_iter();
     let entries = {
         let mut entries = walker
             .filter_entry(is_wgsl_or_dir)
@@ -205,8 +263,28 @@ pub fn init() {
         "re_renderer build.rs found no shaders - I think some path is wrong!"
     );
 
-    for entry in entries {
+    // Register all shader files with Cargo's change tracking first
+    for entry in &entries {
         rerun_if_changed(entry.path());
+    }
+
+    // Check if we need to rebuild based on shader content hashes
+    // Use target directory for persistent caching across incremental builds
+    let target_dir = PathBuf::from(get_and_track_env_var("OUT_DIR").unwrap())
+        .ancestors()
+        .nth(3) // OUT_DIR is target/<profile>/build/<crate>-<hash>/out, go up to target/
+        .unwrap()
+        .to_path_buf()
+        .join("re_renderer_cache");
+
+    if !should_rebuild_shaders(&entries, &shader_dir, &target_dir).unwrap() {
+        println!("cargo:warning=Shaders unchanged, skipping regeneration");
+        return;
+    }
+
+    println!("cargo:warning=Shader changes detected, regenerating workspace_shaders.rs");
+
+    for entry in entries {
 
         // The relative path to get from the current shader file to `workspace_shaders.rs`.
         // We must make sure to pass relative paths to `include_str`!

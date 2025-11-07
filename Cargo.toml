@@ -404,11 +404,13 @@ winit = { version = "0.30.12", default-features = false }
 # See also https://gpuweb.github.io/gpuweb/explainer/#multithreading-transfer (unsolved part of the Spec as of writing!)
 wgpu = { version = "27.0.1", default-features = false, features = [
   # Backends (see https://docs.rs/wgpu/latest/wgpu/#feature-flags)
-  "gles",
-  "metal",
-  "vulkan",
-  "webgl",
-  "webgpu",
+  # Reduced default set for faster compilation - only core backends
+  # NOTE: For release builds, enable additional backends as needed
+  "metal",   # macOS/iOS primary backend
+  "vulkan",  # Linux/Windows primary backend
+  "webgl",   # Web fallback
+  "webgpu",  # Web primary
+  # Removed: "gles" - OpenGL ES fallback, enable only if needed with --features
   #"dx12",   # DX12 backend on wgpu isn't as stable. Also, we want to reduce the number of backends on native. Ideally we only have Vulkan & Metal, but we also keep GL as a manual fallback.
   #"angle",  # As above, we want to limit the numbers of backends we support. GL support via angle isn't great and we didn't need it so far.
 

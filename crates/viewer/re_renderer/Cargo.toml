@@ -36,7 +36,7 @@ ignored = [
 
 
 [features]
-default = ["import-obj", "import-gltf", "import-stl"]
+default = ["import-obj", "import-gltf", "import-stl", "graphics-default"]
 
 ## Support importing .obj files
 import-obj = ["dep:tobj"]
@@ -49,6 +49,22 @@ import-stl = ["dep:stl_io"]
 
 ## Enable (de)serialization using serde.
 serde = ["dep:serde"]
+
+## Graphics backend features
+## Default graphics configuration - uses platform-appropriate backend
+graphics-default = []
+
+## Enable all graphics backends (increases compile time)
+graphics-all = ["graphics-vulkan", "graphics-metal", "graphics-gles"]
+
+## Enable Vulkan backend (Linux, Windows)
+graphics-vulkan = []
+
+## Enable Metal backend (macOS, iOS)
+graphics-metal = []
+
+## Enable OpenGL ES backend (fallback)
+graphics-gles = []
 
 [dependencies]
 re_byte_size.workspace = true
@@ -82,6 +98,9 @@ static_assertions.workspace = true
 thiserror.workspace = true
 type-map.workspace = true
 web-time.workspace = true
+
+# wgpu - use workspace version which includes all backends
+# For faster dev builds, consider building with --no-default-features
 wgpu.workspace = true
 
 # optional
@@ -120,4 +139,6 @@ anyhow.workspace = true
 cfg_aliases.workspace = true
 clean-path.workspace = true
 pathdiff.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 walkdir.workspace = true

@@ -9408,6 +9408,8 @@ dependencies = [
  "re_tracing",
  "re_video",
  "serde",
+ "serde_json",
+ "sha2",
  "slotmap",
  "smallvec",
  "static_assertions",

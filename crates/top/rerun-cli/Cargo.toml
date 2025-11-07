@@ -46,6 +46,17 @@ default = ["web_viewer", "base"]
 ## Our base feature set, included in `default` and in `release`, but excludes the web viewer.
 base = ["native_viewer", "map_view", "oss_server"]
 
+## Minimal CLI feature set for fast development builds.
+## Excludes viewer, server, and map view for significantly faster compilation.
+## Use this when working on core data loading, SDK, or CLI features.
+## Build with: cargo build --no-default-features --features=minimal
+minimal = []
+
+## CLI-only features without any viewer support.
+## Includes data loaders and core functionality, but no visualization.
+## Faster than base, but slower than minimal.
+cli-only = ["oss_server"]
+
 # !!!IMPORTANT!!!
 #
 # Do you _really_ want to add features in `release_no_web_viewer` that are not in `base`?
