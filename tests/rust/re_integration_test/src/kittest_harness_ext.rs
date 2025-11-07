@@ -1,30 +1,30 @@
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
-use egui::Modifiers;
-use egui::PointerButton;
 use egui::accesskit::Role;
 use egui::accesskit::Toggled;
+use egui::Modifiers;
+use egui::PointerButton;
 use egui_kittest::kittest::NodeT as _;
 use egui_kittest::kittest::Queryable as _;
 use parking_lot::Mutex;
 use re_sdk::{
-    Component as _, ComponentDescriptor, EntityPath, EntityPathPart, RecordingInfo, StoreId,
-    StoreKind,
     external::{
         re_log_types::{SetStoreInfo, StoreInfo},
         re_tuid::Tuid,
     },
     log::Chunk,
+    Component as _, ComponentDescriptor, EntityPath, EntityPathPart, RecordingInfo, StoreId,
+    StoreKind,
 };
 use re_viewer::{
-    SystemCommand, SystemCommandSender as _,
     external::{
         re_chunk::{ChunkBuilder, LatestAtQuery},
         re_entity_db::EntityDb,
         re_types,
-        re_viewer_context::{self, ViewerContext, blueprint_timeline},
+        re_viewer_context::{self, blueprint_timeline, ViewerContext},
     },
-    viewer_test_utils::AppTestingExt as _,
+    viewer_test_utils::{self, AppTestingExt as _},
+    SystemCommand, SystemCommandSender as _,
 };
 use re_viewer_context::ContainerId;
 use re_viewport_blueprint::ViewportBlueprint;
@@ -87,6 +87,9 @@ pub trait HarnessExt<'h> {
 
     // Opens / closes app panels
     fn set_panel_opened(&mut self, panel_label: &str, opened: bool);
+
+    // Wait for the viewport blueprint to record a new edit.
+    fn wait_for_blueprint_update(&mut self, description: &'static str);
 
     fn set_blueprint_panel_opened(&mut self, opened: bool) {
         self.set_panel_opened("Blueprint panel toggle", opened);
@@ -405,6 +408,23 @@ impl<'h> HarnessExt<'h> for egui_kittest::Harness<'h, re_viewer::App> {
         self.run_ok();
     }
 
+    fn wait_for_blueprint_update(&mut self, description: &'static str) {
+        let previous_revision = self
+            .run_with_viewer_context(|viewer_context| blueprint_timeline_revision(viewer_context));
+
+        viewer_test_utils::step_until(
+            description,
+            self,
+            move |harness| {
+                harness.run_with_viewer_context(|viewer_context| {
+                    blueprint_timeline_revision(viewer_context) > previous_revision
+                })
+            },
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        );
+    }
+
     fn section<'a>(&'a mut self, section_label: &'a str) -> ViewerSection<'a, 'h>
     where
         'h: 'a,
@@ -424,4 +444,13 @@ impl<'h> HarnessExt<'h> for egui_kittest::Harness<'h, re_viewer::App> {
             section_label: None,
         }
     }
+}
+
+fn blueprint_timeline_revision(viewer_context: &ViewerContext<'_>) -> i64 {
+    let timeline = blueprint_timeline();
+    viewer_context
+        .blueprint_db()
+        .time_histogram(&timeline)
+        .and_then(|hist| hist.max_key())
+        .unwrap_or(-1)
 }

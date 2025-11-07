@@ -1,8 +1,8 @@
 use egui::vec2;
 use egui_kittest::kittest::Queryable as _;
 use re_integration_test::HarnessExt as _;
-use re_sdk::TimePoint;
 use re_sdk::log::RowId;
+use re_sdk::TimePoint;
 use re_viewer::external::re_viewer_context::{ContainerId, ViewClass as _};
 use re_viewer::external::{re_types, re_view_spatial};
 use re_viewer::viewer_test_utils::{self, HarnessOptions};
@@ -220,6 +220,7 @@ pub async fn test_add_container_from_blueprint_panel_menu() {
     harness.snapshot_app("add_container_from_blueprint_panel_menu_2");
 
     harness.click_label("Horizontal");
+    harness.wait_for_blueprint_update("add_container_from_blueprint_panel_menu");
     harness.snapshot_app("add_container_from_blueprint_panel_menu_3");
 }
 
@@ -237,6 +238,7 @@ pub async fn test_add_container_from_selection_panel() {
     harness.snapshot_app("add_container_from_selection_panel_2");
 
     harness.click_label("Vertical");
+    harness.wait_for_blueprint_update("add_container_from_selection_panel");
     harness.snapshot_app("add_container_from_selection_panel_3");
 
     // TODO(aedm): count the labels in the selection panel only
@@ -257,6 +259,7 @@ pub async fn test_multi_change_container_type() {
     harness.snapshot_app("change_container_type_1");
 
     harness.change_dropdown_value("Container kind", "Horizontal");
+    harness.wait_for_blueprint_update("change_container_type");
     harness.snapshot_app("change_container_type_2");
 }
 
@@ -318,6 +321,7 @@ pub async fn test_drag_view_to_other_view_right() {
     harness.snapshot_app("drag_view_to_other_view_right_1");
 
     harness.drop_at(target_pos);
+    harness.wait_for_blueprint_update("drag_view_to_other_view_right");
     harness.snapshot_app("drag_view_to_other_view_right_2");
 }
 
@@ -334,6 +338,7 @@ pub async fn test_drag_view_to_other_view_left() {
     harness.snapshot_app("drag_view_to_other_view_left_1");
 
     harness.drop_at(target_pos);
+    harness.wait_for_blueprint_update("drag_view_to_other_view_left");
     harness.snapshot_app("drag_view_to_other_view_left_2");
 }
 
@@ -350,6 +355,7 @@ pub async fn test_drag_view_to_other_view_center() {
     harness.snapshot_app("drag_view_to_other_view_center_1");
 
     harness.drop_at(target_pos);
+    harness.wait_for_blueprint_update("drag_view_to_other_view_center");
     harness.snapshot_app("drag_view_to_other_view_center_2");
 }
 
@@ -366,6 +372,7 @@ pub async fn test_drag_view_to_other_view_top() {
     harness.snapshot_app("drag_view_to_other_view_top_1");
 
     harness.drop_at(target_pos);
+    harness.wait_for_blueprint_update("drag_view_to_other_view_top");
     harness.snapshot_app("drag_view_to_other_view_top_2");
 }
 
@@ -382,6 +389,7 @@ pub async fn test_drag_view_to_other_view_bottom() {
     harness.snapshot_app("drag_view_to_other_view_bottom_1");
 
     harness.drop_at(target_pos);
+    harness.wait_for_blueprint_update("drag_view_to_other_view_bottom");
     harness.snapshot_app("drag_view_to_other_view_bottom_2");
 }
 
