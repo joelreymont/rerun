@@ -190,12 +190,20 @@ fn main() {
     }
 
     println!("cargo::rustc-check-cfg=cfg(load_shaders_from_disk)");
-    if environment == Environment::DeveloperInWorkspace && !is_release && !targets_wasm {
+    let load_shaders_from_disk = environment == Environment::DeveloperInWorkspace && !is_release && !targets_wasm;
+    if load_shaders_from_disk {
         // Enable hot shader reloading:
         println!("cargo:rustc-cfg=load_shaders_from_disk");
     }
 
     if !should_run(environment) {
+        return;
+    }
+
+    // In dev builds with load_shaders_from_disk enabled, skip shader embedding entirely.
+    // This eliminates build script overhead and enables hot-reloading during development.
+    if load_shaders_from_disk {
+        println!("cargo:warning=Dev build detected: skipping shader embedding (using runtime loading)");
         return;
     }
 

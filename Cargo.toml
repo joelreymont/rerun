@@ -530,6 +530,30 @@ debug = false
 [profile.dev.package."*"]
 opt-level = 2
 
+# Reduce optimization for heavy graphics dependencies to speed up compilation
+# These crates are slow to compile at opt-level 2 and the runtime performance
+# difference is acceptable for development builds
+[profile.dev.package.wgpu]
+opt-level = 1
+
+[profile.dev.package.wgpu-core]
+opt-level = 1
+
+[profile.dev.package.wgpu-hal]
+opt-level = 1
+
+[profile.dev.package.naga]
+opt-level = 1
+
+[profile.dev.package.egui]
+opt-level = 1
+
+[profile.dev.package.eframe]
+opt-level = 1
+
+[profile.dev.package.epaint]
+opt-level = 1
+
 # Make extra sure the AV1 decoder is optimized in dev builds. otherwise decoding comes to a crawl in debug builds.
 [profile.dev.package.re_rav1d]
 opt-level = 3
