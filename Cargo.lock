@@ -3826,6 +3826,7 @@ dependencies = [
  "re_ui",
  "rfd",
  "serde_json",
+ "wgpu",
  "xml-rs",
 ]
 
