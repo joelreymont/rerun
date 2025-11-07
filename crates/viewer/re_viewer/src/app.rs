@@ -1202,28 +1202,6 @@ impl App {
     ) {
         re_tracing::profile_function!();
 
-        // Start tracking RRD loading metrics if profiling is active
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let profiling_active = self.is_profiling();
-            re_log::debug!("Profiling active: {profiling_active}");
-
-            if profiling_active {
-                let source_path = match data_source {
-                    LogDataSource::RrdHttpUrl { url, .. } => url.to_string(),
-                    #[cfg(not(target_arch = "wasm32"))]
-                    LogDataSource::FilePath(_, path) => path.display().to_string(),
-                    LogDataSource::FileContents(_, contents) => contents.name.clone(),
-                    #[cfg(not(target_arch = "wasm32"))]
-                    LogDataSource::Stdin => "<stdin>".to_owned(),
-                    LogDataSource::RedapDatasetPartition { uri, .. } => uri.to_string(),
-                    LogDataSource::RedapProxy(uri) => uri.to_string(),
-                };
-                re_log::info!("🎯 Starting RRD loading metrics tracking for: {source_path}");
-                self.rrd_loading_metrics.start_tracking(source_path);
-            }
-        }
-
         // Check if we've already loaded this data source and should just switch to it.
         //
         // Go through all sources that are still loading and those that are already in the store_hub.
@@ -1335,6 +1313,29 @@ impl App {
             })
         };
 
+        // Start tracking RRD loading metrics if profiling is active
+        // Do this AFTER checking if the source is already loaded, to avoid leaving is_tracking stuck
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let profiling_active = self.is_profiling();
+            re_log::debug!("Profiling active: {profiling_active}");
+
+            if profiling_active {
+                let source_path = match data_source {
+                    LogDataSource::RrdHttpUrl { url, .. } => url.to_string(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    LogDataSource::FilePath(_, path) => path.display().to_string(),
+                    LogDataSource::FileContents(_, contents) => contents.name.clone(),
+                    #[cfg(not(target_arch = "wasm32"))]
+                    LogDataSource::Stdin => "<stdin>".to_owned(),
+                    LogDataSource::RedapDatasetPartition { uri, .. } => uri.to_string(),
+                    LogDataSource::RedapProxy(uri) => uri.to_string(),
+                };
+                re_log::info!("🎯 Starting RRD loading metrics tracking for: {source_path}");
+                self.rrd_loading_metrics.start_tracking(source_path);
+            }
+        }
+
         match data_source
             .clone()
             .stream(&self.connection_registry, Some(waker))
@@ -1348,6 +1349,10 @@ impl App {
             }
             Err(err) => {
                 re_log::error!("Failed to open data source: {}", re_error::format(err));
+
+                // Reset tracking state on failure to prevent UI from showing stuck "Loading..." state
+                #[cfg(not(target_arch = "wasm32"))]
+                self.rrd_loading_metrics.reset();
             }
         }
     }

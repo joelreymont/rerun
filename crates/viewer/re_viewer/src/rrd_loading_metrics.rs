@@ -107,6 +107,14 @@ impl RrdLoadingMetrics {
         }
     }
 
+    /// Reset tracking state (e.g., on error).
+    pub fn reset(&mut self) {
+        if self.is_tracking {
+            re_log::debug!("Resetting RRD loading metrics tracking");
+        }
+        *self = Self::default();
+    }
+
     /// Check if metrics collection is complete.
     #[expect(dead_code)]
     pub fn is_complete(&self) -> bool {
@@ -157,9 +165,32 @@ impl RrdLoadingMetrics {
     }
 
     /// Calculate message throughput in messages per second.
+    ///
+    /// Returns throughput at various stages:
+    /// - After playback complete: total messages / total time
+    /// - After ingestion complete: total messages / time to ingestion
+    /// - During loading: messages so far / elapsed time
     pub fn throughput_msgs_per_sec(&self) -> Option<f64> {
-        self.total_loading_time()
-            .map(|duration| self.total_messages as f64 / duration.as_secs_f64())
+        if self.total_messages == 0 {
+            return None;
+        }
+
+        let duration = if let Some(total_time) = self.total_loading_time() {
+            // Playback complete - use final total time
+            total_time
+        } else if let (Some(start), Some(ingested)) =
+            (self.loading_start, self.all_messages_ingested)
+        {
+            // Ingestion complete but playback ongoing - use time to ingestion
+            ingested.duration_since(start)
+        } else if let Some(start) = self.loading_start {
+            // Still loading - use elapsed time for real-time throughput
+            start.elapsed()
+        } else {
+            return None;
+        };
+
+        Some(self.total_messages as f64 / duration.as_secs_f64())
     }
 
     /// Emit metrics to console log.
