@@ -12,7 +12,7 @@ re_ui.workspace = true
 
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-eframe = { workspace = true, default-features = false, features = ["wgpu"] }
+eframe = { workspace = true, features = ["wgpu"] }
 egui.workspace = true
 egui_extras.workspace = true
 rfd = "0.15"
