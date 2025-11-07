@@ -3814,6 +3814,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1671b620ba6e60c11c62b0ea5fec4f8621991e7b1229fa13c010a2cd04e4342"
 
 [[package]]
+name = "flamegraph_compare"
+version = "0.27.0-alpha.8+dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "re_log",
+ "re_ui",
+ "rfd",
+ "serde_json",
+ "xml-rs",
+]
+
+[[package]]
 name = "flatbuffers"
 version = "25.9.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"

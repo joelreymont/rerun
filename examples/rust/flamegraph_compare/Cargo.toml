@@ -1,0 +1,20 @@
+[package]
+name = "flamegraph_compare"
+version = "0.27.0-alpha.8+dev"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+re_log.workspace = true
+re_ui.workspace = true
+
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+eframe = { workspace = true, default-features = false, features = ["wgpu"] }
+egui.workspace = true
+egui_extras.workspace = true
+rfd = "0.15"
+serde_json.workspace = true
+xml-rs = "0.8"
