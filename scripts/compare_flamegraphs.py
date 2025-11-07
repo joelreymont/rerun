@@ -6,18 +6,21 @@ This script compares two flamegraph files and produces a detailed performance re
 showing improvements or regressions between the baseline and optimized versions.
 
 Supported formats:
+- SVG format (interactive flamegraph SVG files)
 - Collapsed stack format (standard flamegraph format): "func1;func2;func3 100"
 - JSON format (for tools like puffin)
 
 Usage:
-    python compare_flamegraphs.py baseline.txt optimized.txt [--format collapsed|json] [--output report.txt]
+    python compare_flamegraphs.py baseline.svg optimized.svg [--format svg|collapsed|json] [--output report.txt]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,22 +164,113 @@ def parse_json_format(file_path: Path) -> FlameGraphData:
     return data
 
 
+def parse_svg_format(file_path: Path) -> FlameGraphData:
+    """Parse a flamegraph SVG file.
+
+    SVG flamegraphs contain stack information in <title> elements within <g> elements.
+    The title typically contains the function stack and sample counts.
+    Example: "func1;func2;func3 (100 samples, 5.50%)" or "func1;func2;func3 100"
+    """
+    data = FlameGraphData()
+
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+
+        # SVG files use namespaces, handle both with and without
+        namespaces = {"svg": "http://www.w3.org/2000/svg"}
+
+        # Find all title elements (they contain stack information)
+        # Try with namespace first, then without
+        titles = root.findall(".//svg:title", namespaces)
+        if not titles:
+            titles = root.findall(".//title")
+
+        for title in titles:
+            if title.text is None:
+                continue
+
+            text = title.text.strip()
+
+            # Skip "all" or other meta entries
+            if text.lower() in ["all", "flamegraph"]:
+                continue
+
+            # Parse the title text
+            # Common formats:
+            # 1. "func1;func2;func3 (100 samples, 5.50%)"
+            # 2. "func1;func2;func3 100"
+            # 3. "func1;func2;func3 (100)"
+
+            # Try to extract stack and count
+            stack = None
+            count = 0
+
+            # Pattern 1: "stack (N samples, X%)" or "stack (N samples)"
+            match = re.match(r"^(.+?)\s+\((\d+(?:,\d+)*)\s+samples", text)
+            if match:
+                stack = match.group(1).strip()
+                count_str = match.group(2).replace(",", "")
+                count = int(count_str)
+            else:
+                # Pattern 2: "stack (N)" or "stack N"
+                match = re.match(r"^(.+?)\s+\(?(\d+(?:,\d+)*)\)?$", text)
+                if match:
+                    stack = match.group(1).strip()
+                    count_str = match.group(2).replace(",", "")
+                    count = int(count_str)
+                else:
+                    # Fallback: try to find any numbers at the end
+                    match = re.match(r"^(.+?)\s+.*?(\d+(?:,\d+)*).*$", text)
+                    if match:
+                        stack = match.group(1).strip()
+                        count_str = match.group(2).replace(",", "")
+                        try:
+                            count = int(count_str)
+                        except ValueError:
+                            continue
+                    else:
+                        # No count found, skip this entry
+                        continue
+
+            if stack and count > 0:
+                data.add_stack(stack, count)
+
+    except ET.ParseError as e:
+        print(f"Error parsing SVG file: {e}", file=sys.stderr)
+        raise ValueError(f"Failed to parse SVG file: {e}")
+
+    if data.total_samples == 0:
+        print(
+            "Warning: No samples found in SVG file. The file may not be a valid flamegraph.",
+            file=sys.stderr,
+        )
+
+    return data
+
+
 def parse_flamegraph(file_path: Path, format_type: str = "auto") -> FlameGraphData:
     """Parse a flamegraph file, auto-detecting format if needed."""
     if format_type == "auto":
         # Auto-detect based on file extension or content
-        if file_path.suffix.lower() == ".json":
+        if file_path.suffix.lower() == ".svg":
+            format_type = "svg"
+        elif file_path.suffix.lower() == ".json":
             format_type = "json"
         else:
             # Try to detect by peeking at first line
-            with open(file_path) as f:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
                 first_line = f.readline().strip()
-                if first_line.startswith("{") or first_line.startswith("["):
+                if first_line.startswith("<?xml") or first_line.startswith("<svg"):
+                    format_type = "svg"
+                elif first_line.startswith("{") or first_line.startswith("["):
                     format_type = "json"
                 else:
                     format_type = "collapsed"
 
-    if format_type == "json":
+    if format_type == "svg":
+        return parse_svg_format(file_path)
+    elif format_type == "json":
         return parse_json_format(file_path)
     else:
         return parse_collapsed_format(file_path)
@@ -410,16 +504,20 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Compare two collapsed flamegraph files
+  # Compare two SVG flamegraph files
+  %(prog)s baseline.svg optimized.svg
+
+  # Compare collapsed format flamegraph files
   %(prog)s baseline.txt optimized.txt
 
   # Compare and save report to file
-  %(prog)s baseline.txt optimized.txt --output report.txt
+  %(prog)s baseline.svg optimized.svg --output report.txt
 
-  # Explicitly specify JSON format
+  # Explicitly specify format
   %(prog)s baseline.json optimized.json --format json
 
 Supported formats:
+  - svg:       Interactive flamegraph SVG files (most common)
   - collapsed: Standard flamegraph format (func1;func2;func3 100)
   - json:      JSON format with stack arrays
   - auto:      Auto-detect based on file extension (default)
@@ -432,7 +530,7 @@ Supported formats:
     )
     parser.add_argument(
         "--format",
-        choices=["auto", "collapsed", "json"],
+        choices=["auto", "svg", "collapsed", "json"],
         default="auto",
         help="Format of the flamegraph files (default: auto)",
     )
