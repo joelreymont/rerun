@@ -231,6 +231,10 @@ impl AnnotationMap {
     pub fn load(&mut self, ctx: &ViewerContext<'_>, time_query: &LatestAtQuery) {
         re_tracing::profile_function!();
 
+        // Track annotation loads for performance monitoring
+        use std::sync::atomic::Ordering;
+        crate::performance_metrics::ANNOTATION_LOADS_THIS_FRAME.fetch_add(1, Ordering::Relaxed);
+
         let entities_with_annotation_context =
             AnnotationContextStoreSubscriber::access(ctx.recording().store_id(), |entities| {
                 entities.clone()

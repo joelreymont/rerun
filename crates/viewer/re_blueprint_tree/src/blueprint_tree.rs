@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use egui::{Response, Ui, WidgetInfo, WidgetType};
 use smallvec::SmallVec;
 
+use re_chunk_store::ChunkStoreGeneration;
 use re_context_menu::{SelectionUpdateBehavior, context_menu_ui_for_item_with_context};
 use re_data_ui::item_ui::guess_instance_path_icon;
 use re_entity_db::InstancePath;
@@ -20,6 +23,36 @@ use re_viewport_blueprint::{ViewportBlueprint, ui::show_add_view_or_container_mo
 use crate::data::{
     BlueprintTreeData, ContainerData, ContentsData, DataResultData, DataResultKind, ViewData,
 };
+
+// ============================================================================
+// Blueprint Tree Cache
+// ============================================================================
+
+/// Cache key for blueprint tree data.
+///
+/// The blueprint tree is expensive to build (walks all containers, views, and data results).
+/// We cache it and only rebuild when the blueprint, recording, or filter changes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct BlueprintTreeCacheKey {
+    /// Generation of the blueprint database (tracks blueprint modifications)
+    blueprint_generation: ChunkStoreGeneration,
+
+    /// Generation of the recording database (tracks data changes)
+    recording_generation: ChunkStoreGeneration,
+
+    /// Current filter string (empty if no filter active)
+    filter_string: String,
+}
+
+impl BlueprintTreeCacheKey {
+    fn from_context(ctx: &ViewerContext<'_>, filter_query: Option<&str>) -> Self {
+        Self {
+            blueprint_generation: ctx.blueprint_db().generation(),
+            recording_generation: ctx.recording().generation(),
+            filter_string: filter_query.unwrap_or_default().to_string(),
+        }
+    }
+}
 
 /// Holds the state of the blueprint tree UI.
 #[derive(Default)]
@@ -62,12 +95,33 @@ pub struct BlueprintTree {
     /// IMPORTANT: Always make sure that the item will be drawn this or next frame when setting this
     /// to `Some`, so that this flag is immediately consumed.
     scroll_to_me_item: Option<Item>,
+
+    // ========================================================================
+    // Blueprint Tree Cache
+    // ========================================================================
+    /// Cached blueprint tree data from previous frame
+    ///
+    /// Wrapped in Arc to allow cheap cloning for the UI without holding a borrow.
+    cached_tree: Option<Arc<BlueprintTreeData>>,
+
+    /// Cache key used for the cached tree
+    cache_key: Option<BlueprintTreeCacheKey>,
 }
 
 impl BlueprintTree {
     /// Activates the search filter (for e.g. test purposes).
     pub fn activate_filter(&mut self, query: &str) {
         self.filter_state.activate(query);
+    }
+
+    /// Explicitly invalidate the blueprint tree cache.
+    ///
+    /// This is useful for testing or when you know the blueprint has changed
+    /// but the generation counter hasn't been incremented yet.
+    #[allow(dead_code)] // May be useful for future debugging
+    pub fn invalidate_cache(&mut self) {
+        self.cached_tree = None;
+        self.cache_key = None;
     }
 
     /// Show the Blueprint section of the left panel based on the current [`ViewportBlueprint`]
@@ -131,11 +185,42 @@ impl BlueprintTree {
         self.candidate_drop_parent_container_id = self.next_candidate_drop_parent_container_id;
         self.next_candidate_drop_parent_container_id = None;
 
-        let blueprint_tree_data = BlueprintTreeData::from_blueprint_and_filter(
-            ctx,
-            viewport_blueprint,
-            &self.filter_state.filter(),
-        );
+        // Generate cache key for current frame
+        let current_key = BlueprintTreeCacheKey::from_context(ctx, self.filter_state.query());
+
+        // Check if we can reuse cached tree data
+        let blueprint_tree_data = if self.cache_key.as_ref() == Some(&current_key) {
+            // Cache hit - reuse existing tree data (cheap Arc clone)
+            re_tracing::profile_scope!("blueprint_tree_cache_hit");
+
+            #[cfg(not(target_arch = "wasm32"))]
+            re_viewer_context::performance_metrics::BLUEPRINT_TREE_CACHE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            self.cached_tree
+                .as_ref()
+                .expect("cache_key set but cached_tree is None")
+                .clone()
+        } else {
+            // Cache miss - rebuild tree data
+            re_tracing::profile_scope!("blueprint_tree_cache_miss_rebuild");
+
+            #[cfg(not(target_arch = "wasm32"))]
+            re_viewer_context::performance_metrics::BLUEPRINT_TREE_CACHE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let tree_data = BlueprintTreeData::from_blueprint_and_filter(
+                ctx,
+                viewport_blueprint,
+                &self.filter_state.filter(),
+            );
+
+            // Update cache with Arc-wrapped tree data
+            let arc_tree_data = Arc::new(tree_data);
+            self.cached_tree = Some(arc_tree_data.clone());
+            self.cache_key = Some(current_key);
+            arc_tree_data
+        };
 
         egui::ScrollArea::both()
             .id_salt("blueprint_tree_scroll_area")

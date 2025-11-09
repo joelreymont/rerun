@@ -147,8 +147,13 @@ pub fn annotations(
     entity_path: &re_entity_db::EntityPath,
 ) -> std::sync::Arc<re_viewer_context::Annotations> {
     re_tracing::profile_function!();
-    let mut annotation_map = re_viewer_context::AnnotationMap::default();
-    annotation_map.load(ctx, query);
+
+    // Use frame-cached annotation map to avoid redundant loading
+    let annotation_map = ctx
+        .store_context
+        .caches
+        .entry(|c: &mut re_viewer_context::AnnotationMapCache| c.get(ctx, query));
+
     annotation_map.find(entity_path)
 }
 

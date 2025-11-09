@@ -105,6 +105,10 @@ pub struct AppState {
     /// that last several frames.
     #[serde(skip)]
     pub(crate) focused_item: Option<Item>,
+
+    /// Cache for visualizable entities per view to avoid redundant determination.
+    #[serde(skip)]
+    visualizable_entities_cache: crate::visualizable_entities_cache::VisualizableEntitiesCache,
 }
 
 impl Default for AppState {
@@ -127,6 +131,7 @@ impl Default for AppState {
             view_states: Default::default(),
             selection_state: Default::default(),
             focused_item: Default::default(),
+            visualizable_entities_cache: Default::default(),
 
             #[cfg(feature = "testing")]
             test_hook: None,
@@ -292,6 +297,27 @@ impl AppState {
                 let indicated_entities_per_visualizer =
                     view_class_registry.indicated_entities_per_visualizer(recording.store_id());
 
+                // Pre-compute visualizable entities for all views using the cache
+                let visualizable_entities_per_view: HashMap<ViewId, _> = {
+                    re_tracing::profile_scope!("visualizable_entities_determination");
+                    viewport_ui
+                        .blueprint
+                        .views
+                        .values()
+                        .map(|view| {
+                            let visualizable_entities = self
+                                .visualizable_entities_cache
+                                .get_or_determine(
+                                    view,
+                                    recording,
+                                    &maybe_visualizable_entities_per_visualizer,
+                                    view_class_registry,
+                                );
+                            (view.id, visualizable_entities)
+                        })
+                        .collect()
+                };
+
                 // Execute the queries for every `View`
                 let query_results = {
                     re_tracing::profile_scope!("query_results");
@@ -300,18 +326,7 @@ impl AppState {
                         .views
                         .values()
                         .map(|view| {
-                            // TODO(andreas): This needs to be done in a store subscriber that exists per view (instance, not class!).
-                            // Note that right now we determine *all* visualizable entities, not just the queried ones.
-                            // In a store subscriber set this is fine, but on a per-frame basis it's wasteful.
-                            let visualizable_entities = view
-                                .class(view_class_registry)
-                                .determine_visualizable_entities(
-                                    &maybe_visualizable_entities_per_visualizer,
-                                    recording,
-                                    &view_class_registry
-                                        .new_visualizer_collection(view.class_identifier()),
-                                    &view.space_origin,
-                                );
+                            let visualizable_entities = &visualizable_entities_per_view[&view.id];
 
                             (
                                 view.id,
@@ -319,7 +334,7 @@ impl AppState {
                                     store_context,
                                     view_class_registry,
                                     &blueprint_query,
-                                    &visualizable_entities,
+                                    visualizable_entities,
                                 ),
                             )
                         })
@@ -390,6 +405,7 @@ impl AppState {
                     &maybe_visualizable_entities_per_visualizer,
                     &indicated_entities_per_visualizer,
                     view_states,
+                    &visualizable_entities_per_view,
                 );
 
                 // We need to recreate the context to appease the borrow checker. It is a bit annoying, but
@@ -807,6 +823,7 @@ fn update_overrides(
     maybe_visualizable_entities_per_visualizer: &PerVisualizer<MaybeVisualizableEntities>,
     indicated_entities_per_visualizer: &PerVisualizer<IndicatedEntities>,
     view_states: &mut ViewStates,
+    visualizable_entities_per_view: &HashMap<ViewId, PerVisualizer<re_viewer_context::VisualizableEntities>>,
 ) -> HashMap<ViewId, DataQueryResult> {
     use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 
@@ -845,23 +862,16 @@ fn update_overrides(
                  view_state,
                  mut query_result,
              }| {
-                // TODO(andreas): This needs to be done in a store subscriber that exists per view (instance, not class!).
-                // Note that right now we determine *all* visualizable entities, not just the queried ones.
-                // In a store subscriber set this is fine, but on a per-frame basis it's wasteful.
-                let visualizable_entities = view
-                    .class(view_class_registry)
-                    .determine_visualizable_entities(
-                        maybe_visualizable_entities_per_visualizer,
-                        store_context.recording,
-                        &view_class_registry.new_visualizer_collection(view.class_identifier()),
-                        &view.space_origin,
-                    );
+                // Use pre-computed visualizable entities from cache
+                let visualizable_entities = visualizable_entities_per_view
+                    .get(&view.id)
+                    .expect("visualizable entities should exist for all views");
 
                 let resolver = re_viewport_blueprint::DataQueryPropertyResolver::new(
                     view,
                     view_class_registry,
                     maybe_visualizable_entities_per_visualizer,
-                    &visualizable_entities,
+                    visualizable_entities,
                     indicated_entities_per_visualizer,
                 );
 

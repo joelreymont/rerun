@@ -25,6 +25,7 @@ mod item;
 mod item_collection;
 mod maybe_mut_ref;
 pub mod open_url;
+pub mod performance_metrics;
 mod query_context;
 mod query_range;
 mod recording_or_table;
@@ -55,9 +56,9 @@ pub use self::{
     blueprint_helpers::{BlueprintContext, blueprint_timeline, blueprint_timepoint_for_writes},
     blueprint_id::{BlueprintId, BlueprintIdRegistry, ContainerId, GLOBAL_VIEW_ID, ViewId},
     cache::{
-        Cache, CacheMemoryReport, CacheMemoryReportItem, Caches, ImageDecodeCache, ImageStatsCache,
-        SharablePlayableVideoStream, TensorStatsCache, VideoAssetCache, VideoStreamCache,
-        VideoStreamProcessingError,
+        AnnotationMapCache, Cache, CacheMemoryReport, CacheMemoryReportItem, Caches,
+        ImageDecodeCache, ImageStatsCache, SharablePlayableVideoStream, TensorStatsCache,
+        VideoAssetCache, VideoStreamCache, VideoStreamProcessingError,
     },
     collapsed_id::{CollapseItem, CollapseScope, CollapsedId},
     command_sender::{

@@ -16,10 +16,12 @@ pub mod env_vars;
 pub mod event;
 mod navigation;
 mod open_url_description;
+mod performance_panel;
 mod saving;
 mod screenshotter;
 mod startup_options;
 mod ui;
+mod visualizable_entities_cache;
 
 #[cfg(feature = "analytics")]
 mod viewer_analytics;
