@@ -29,9 +29,10 @@ linker = "rust-lld"
 # Use mold linker on Linux for faster linking (if available)
 # Install with: cargo install -f mold
 # This can provide 2-5x faster linking compared to ld
+# NOTE: Falling back to lld since mold is not available
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 # Fallback: use lld if mold is not available
 # Uncomment the following and comment out mold if needed:
