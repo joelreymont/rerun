@@ -242,13 +242,15 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 - [x] Add compilation time tracking to CI ✅ Implemented 2025-11-09
 
 ### Quarter 2: Dependency Optimization
-- [ ] Replace `chrono` with `time`
-- [ ] Evaluate and replace `clap` (if beneficial)
-- [ ] Simplify `re_web_server` (remove hyper/tokio)
-- [ ] Remove `strum` and `enumset`
-- [ ] Replace `image` with `zune-image`
-- [ ] Audit all build scripts
-- [ ] Run `cargo-udeps` and `cargo-machete`
+- [x] Comprehensive dependency analysis ✅ See [Q2_DEPENDENCY_ANALYSIS.md](Q2_DEPENDENCY_ANALYSIS.md)
+- [x] Audit all build scripts ✅ Already well-optimized
+- [ ] Replace `enumset` with `bitflags` in re_renderer (tractable, low risk)
+- [ ] Complete `image` → `zune-image` evaluation (started in PR #1425)
+- [~] Replace `chrono` with `time` ❌ Not beneficial (needed transitively)
+- [~] Replace `clap` ❌ Too invasive for benefit (15+ crates)
+- [~] Simplify `re_web_server` ❌ Crate doesn't exist / not applicable
+- [~] Remove `strum` ⚠️ Deferred to Q3 (needs re_rav1d update first)
+- [ ] Run `cargo-udeps` and `cargo-machete` (manual analysis step)
 
 ### Quarter 3: Build System Refinement
 - [ ] Conditional shader embedding
