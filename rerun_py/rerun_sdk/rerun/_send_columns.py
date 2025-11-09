@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Protocol, TypeVar, overload
 
 import numpy as np
@@ -17,6 +18,54 @@ if TYPE_CHECKING:
     from datetime import datetime, timedelta
 
     from .recording_stream import RecordingStream
+
+# Default maximum chunk size: 100 MB.
+# This can be overridden via RERUN_MAX_CHUNK_SIZE environment variable (in bytes).
+_DEFAULT_MAX_CHUNK_SIZE = 100 * 1024 * 1024
+
+
+def _get_max_chunk_size() -> int:
+    """Return the active maximum chunk size."""
+
+    env_value = os.environ.get("RERUN_MAX_CHUNK_SIZE")
+    if env_value is None:
+        return _DEFAULT_MAX_CHUNK_SIZE
+
+    try:
+        chunk_size = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"RERUN_MAX_CHUNK_SIZE must be an integer representing the limit in bytes, got {env_value!r}"
+        ) from exc
+
+    if chunk_size <= 0:
+        raise ValueError(
+            f"RERUN_MAX_CHUNK_SIZE must be a positive integer value, got {env_value!r}"
+        )
+
+    return chunk_size
+
+
+def _format_bytes(num_bytes: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.1f} TB"
+
+
+def _estimate_arrow_array_size(array: pa.Array) -> int:
+    """
+    Estimate the memory size of a PyArrow array in bytes.
+
+    This accounts for all buffers (data, offsets, validity, etc.).
+    """
+    total = 0
+    for buffer in array.buffers():
+        if buffer is not None:
+            total += buffer.size
+    return total
 
 
 class TimeColumnLike(Protocol):
@@ -316,9 +365,179 @@ def send_columns(
 
         columns_args[component_descr] = arrow_list_array
 
+    # Validate chunk size to prevent memory issues (issue #11701)
+    # Estimate the total size of the chunk
+    chunk_size = 0
+    for time_array in timelines_args.values():
+        chunk_size += _estimate_arrow_array_size(time_array)
+    for component_array in columns_args.values():
+        chunk_size += _estimate_arrow_array_size(component_array)
+
+    max_chunk_size = _get_max_chunk_size()
+    if chunk_size > max_chunk_size:
+        raise ValueError(
+            f"Chunk size ({_format_bytes(chunk_size)}) exceeds maximum allowed size "
+            f"({_format_bytes(max_chunk_size)}). "
+            f"This limit prevents memory issues when transmitting large batches. "
+            f"Consider splitting your data into smaller batches. "
+            f"You can adjust the limit via the RERUN_MAX_CHUNK_SIZE environment variable. "
+            f"See https://github.com/rerun-io/rerun/issues/11701 for details."
+        )
+
     bindings.send_arrow_chunk(
         entity_path,
         timelines={t.timeline_name(): t.as_arrow_array() for t in indexes},
         components=columns_args,
         recording=recording.to_native() if recording is not None else None,
     )
+
+
+@catch_and_log_exceptions()
+def send_columns_batched(
+    entity_path: str,
+    indexes: Iterable[TimeColumnLike],
+    columns: Iterable[ComponentColumn],
+    *,
+    batch_size: int | None = None,
+    max_chunk_size: int | None = None,
+    recording: RecordingStream | None = None,
+    strict: bool | None = None,  # noqa: ARG001 - `strict` handled by `@catch_and_log_exceptions`
+) -> None:
+    """
+    Send columnar data to Rerun in batches to avoid memory issues.
+
+    This is a helper function that automatically splits large datasets into appropriately-sized
+    chunks before sending them via `send_columns()`. This prevents memory issues on both the
+    server and client side when working with large datasets.
+
+    See `send_columns()` for more details on the columnar API.
+
+    Parameters
+    ----------
+    entity_path:
+        Path to the entity in the space hierarchy.
+    indexes:
+        The time values of this batch of data. Must support slicing if batch_size is not provided.
+    columns:
+        The columns of components to log. Must support slicing if batch_size is not provided.
+    batch_size:
+        Number of rows per batch. If not specified, will be calculated based on max_chunk_size.
+    max_chunk_size:
+        Maximum size of each chunk in bytes. Defaults to RERUN_MAX_CHUNK_SIZE.
+        Only used if batch_size is not provided.
+    recording:
+        Specifies the recording stream to use.
+    strict:
+        If True, raise exceptions on non-loggable data.
+        If False, warn on non-loggable data.
+
+    Examples
+    --------
+    ```python
+    import numpy as np
+    import rerun as rr
+
+    # Generate large dataset
+    images = np.random.randint(0, 255, (2000, 480, 640, 3), dtype=np.uint8)
+    times = np.arange(2000)
+
+    # Send in batches automatically
+    rr.send_columns_batched(
+        "camera/images",
+        indexes=[rr.TimeColumn("frame", sequence=times)],
+        columns=[rr.components.ImageBufferBatch(images)],
+        batch_size=100,  # Send 100 images at a time
+    )
+    ```
+
+    """
+    # Convert to lists so we can slice them
+    indexes_list = list(indexes)
+    columns_list = list(columns)
+
+    # Determine total length from first column
+    if columns_list:
+        total_length = len(columns_list[0].as_arrow_array())
+    elif indexes_list:
+        total_length = len(indexes_list[0].as_arrow_array())
+    else:
+        return  # Nothing to send
+
+    # Calculate batch size if not provided
+    if batch_size is None:
+        chunk_limit = max_chunk_size if max_chunk_size is not None else _get_max_chunk_size()
+        # Estimate size per row by checking first few rows
+        test_size = min(10, total_length)
+        if test_size > 0:
+            test_chunk_size = 0
+            for idx in indexes_list:
+                arr = idx.as_arrow_array()
+                test_chunk_size += _estimate_arrow_array_size(arr[:test_size])
+            for col in columns_list:
+                arr = col.as_arrow_array()
+                test_chunk_size += _estimate_arrow_array_size(arr[:test_size])
+
+            bytes_per_row = test_chunk_size / test_size
+            # Use 80% of limit to leave headroom
+            batch_size = max(1, int((chunk_limit * 0.8) / bytes_per_row))
+        else:
+            batch_size = 100  # Fallback
+
+    # Send in batches
+    num_batches = (total_length + batch_size - 1) // batch_size
+
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min(start_idx + batch_size, total_length)
+
+        # Slice each index and column
+        batch_indexes = []
+        for idx in indexes_list:
+            arr = idx.as_arrow_array()
+            sliced_arr = arr[start_idx:end_idx]
+            # Create a new TimeColumn-like object with the sliced data
+            # We need to preserve the timeline name
+            timeline_name = idx.timeline_name()
+
+            # Create a simple wrapper that implements TimeColumnLike
+            class SlicedTimeColumn:
+                def __init__(self, name: str, data: pa.Array) -> None:
+                    self._name = name
+                    self._data = data
+
+                def timeline_name(self) -> str:
+                    return self._name
+
+                def as_arrow_array(self) -> pa.Array:
+                    return self._data
+
+            batch_indexes.append(SlicedTimeColumn(timeline_name, sliced_arr))
+
+        batch_columns = []
+        for col in columns_list:
+            arr = col.as_arrow_array()
+            sliced_arr = arr[start_idx:end_idx]
+            # Create a new ComponentColumn with the sliced data
+            descriptor = col.component_descriptor()
+
+            class SlicedComponentColumn:
+                def __init__(self, desc: ComponentDescriptor, data: pa.Array) -> None:
+                    self._desc = desc
+                    self._data = data
+
+                def component_descriptor(self) -> ComponentDescriptor:
+                    return self._desc
+
+                def as_arrow_array(self) -> pa.Array:
+                    return self._data
+
+            batch_columns.append(SlicedComponentColumn(descriptor, sliced_arr))
+
+        # Send this batch
+        send_columns(
+            entity_path,
+            indexes=batch_indexes,
+            columns=batch_columns,
+            recording=recording,
+            strict=strict,
+        )

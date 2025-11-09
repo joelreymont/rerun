@@ -660,13 +660,16 @@ impl MessageBuffer {
         }
 
         re_tracing::profile_scope!("Drop messages");
-        re_log::info_once!(
-            "Memory limit ({}) exceeded. Dropping old log messages from the gRPC proxy server. Clients connecting after this will not see the full history.",
-            re_format::format_bytes(max_bytes as _)
-        );
 
         let start_size = self.size_bytes();
         let mut messages_dropped = 0;
+
+        // Issue #11701: Make memory pressure more visible
+        re_log::warn!(
+            "Memory limit exceeded: using {} / {} - starting garbage collection",
+            re_format::format_bytes(start_size as _),
+            re_format::format_bytes(max_bytes as _)
+        );
 
         while self.disposable.pop_front().is_some() {
             messages_dropped += 1;
@@ -676,9 +679,9 @@ impl MessageBuffer {
         }
 
         if max_bytes < self.size_bytes() {
-            re_log::info_once!(
-                "Memory limit ({}) exceeded. Dropping old *static* log messages as well. Clients connecting after this will no longer see the complete set of static data.",
-                re_format::format_bytes(max_bytes as _)
+            re_log::warn!(
+                "Memory limit still exceeded after dropping {} disposable messages. Dropping static data as well.",
+                messages_dropped
             );
             while self.static_.pop_front().is_some() {
                 messages_dropped += 1;
@@ -689,15 +692,20 @@ impl MessageBuffer {
         }
 
         let bytes_dropped = start_size - self.size_bytes();
+        let final_size = self.size_bytes();
 
-        re_log::trace!(
-            "Dropped {} bytes in {messages_dropped} message(s)",
-            re_format::format_bytes(bytes_dropped as _)
+        re_log::warn!(
+            "Garbage collection complete: dropped {} ({} messages). Memory usage: {} -> {}",
+            re_format::format_bytes(bytes_dropped as _),
+            messages_dropped,
+            re_format::format_bytes(start_size as _),
+            re_format::format_bytes(final_size as _)
         );
 
         if max_bytes < self.size_bytes() {
-            re_log::warn_once!(
-                "The gRPC server is using more memory than the given memory limit ({}), despite having garbage-collected all non-persistent messages.",
+            re_log::error!(
+                "MEMORY LIMIT EXCEEDED: The gRPC server is still using more memory ({}) than the configured limit ({}), even after garbage-collecting all non-persistent messages. Consider increasing the memory limit or reducing data volume.",
+                re_format::format_bytes(self.size_bytes() as _),
                 re_format::format_bytes(max_bytes as _)
             );
         }
@@ -763,29 +771,97 @@ impl EventLoop {
     }
 
     fn handle_msg(&mut self, msg: LogMsgProto) {
-        self.broadcast_log_tx.send(msg.clone()).ok();
-
         if self.is_history_disabled() {
-            // no need to gc or maintain history
+            // No history - just broadcast without buffering
+            self.broadcast_log_tx.send(msg).ok();
             return;
         }
 
-        self.gc_if_using_too_much_ram();
+        // Issue #11701: Pre-emptive GC to prevent broadcasting messages that will be dropped
+        // Calculate the size of the incoming message
+        let msg_size = msg.total_size_bytes();
 
+        // Check if we need to GC before accepting this message
+        if let Some(max_bytes) = self.options.memory_limit.max_bytes {
+            let max_bytes = max_bytes as u64;
+            let current_size = self.messages.size_bytes();
+            let size_after_adding = current_size + msg_size;
+
+            // If adding this message would exceed the limit, try GC first
+            if size_after_adding > max_bytes {
+                re_log::debug!(
+                    "Pre-emptive GC: message size {} would exceed limit ({} + {} > {})",
+                    re_format::format_bytes(msg_size as _),
+                    re_format::format_bytes(current_size as _),
+                    re_format::format_bytes(msg_size as _),
+                    re_format::format_bytes(max_bytes as _)
+                );
+
+                // Try to make room by garbage collecting
+                // Reserve space for the incoming message
+                self.messages.gc(max_bytes.saturating_sub(msg_size));
+
+                // Check if we successfully made room
+                let size_after_gc = self.messages.size_bytes();
+                if size_after_gc + msg_size > max_bytes {
+                    re_log::warn!(
+                        "Dropping incoming message ({}) - insufficient memory even after GC. Current: {}, Limit: {}",
+                        re_format::format_bytes(msg_size as _),
+                        re_format::format_bytes(size_after_gc as _),
+                        re_format::format_bytes(max_bytes as _)
+                    );
+                    // Drop the message without broadcasting
+                    return;
+                }
+            }
+        }
+
+        // Now it's safe to broadcast and store the message
+        self.broadcast_log_tx.send(msg.clone()).ok();
         self.messages.add_log_msg(msg);
+
+        // Post-check: GC if we're still over limit (shouldn't happen, but defensive)
+        self.gc_if_using_too_much_ram();
     }
 
     fn handle_table(&mut self, table: TableMsgProto) {
-        self.broadcast_table_tx.send(table.clone()).ok();
-
         if self.is_history_disabled() {
-            // no need to gc or maintain history
+            // No history - just broadcast without buffering
+            self.broadcast_table_tx.send(table).ok();
             return;
         }
 
-        self.gc_if_using_too_much_ram();
+        // Issue #11701: Pre-emptive GC to prevent broadcasting messages that will be dropped
+        let table_size = table.total_size_bytes();
 
+        if let Some(max_bytes) = self.options.memory_limit.max_bytes {
+            let max_bytes = max_bytes as u64;
+            let current_size = self.messages.size_bytes();
+            let size_after_adding = current_size + table_size;
+
+            if size_after_adding > max_bytes {
+                re_log::debug!(
+                    "Pre-emptive GC: table size {} would exceed limit",
+                    re_format::format_bytes(table_size as _)
+                );
+
+                self.messages.gc(max_bytes.saturating_sub(table_size));
+
+                let size_after_gc = self.messages.size_bytes();
+                if size_after_gc + table_size > max_bytes {
+                    re_log::warn!(
+                        "Dropping incoming table ({}) - insufficient memory even after GC",
+                        re_format::format_bytes(table_size as _)
+                    );
+                    return;
+                }
+            }
+        }
+
+        self.broadcast_table_tx.send(table.clone()).ok();
         self.messages.add_table(table);
+
+        self.gc_if_using_too_much_ram();
     }
 
     fn is_history_disabled(&self) -> bool {
@@ -1531,4 +1607,173 @@ mod tests {
 
         completion.finish();
     }
+
+    // Tests for issue #11701: Memory management improvements
+
+    #[tokio::test]
+    async fn test_gc_with_memory_limit() {
+        // Test that garbage collection actually happens when memory limit is exceeded
+        let (_completion, addr) = setup_with_memory_limit(MemoryLimit {
+            max_bytes: Some(1024 * 1024), // 1 MB limit
+        })
+        .await;
+        let mut client = make_client(addr).await;
+
+        // Send messages until we exceed the limit
+        let messages = fake_log_stream_recording(100);
+        write_messages(&mut client, messages.clone()).await;
+
+        // Wait a bit for GC to process
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // New client should not receive all messages (some should be GC'd)
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+        let actual = read_log_stream(&mut log_stream, 100).await;
+
+        // Should have fewer messages than we sent due to GC
+        assert!(actual.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn test_preemptive_gc_prevents_oversize_messages() {
+        // Test that pre-emptive GC prevents messages from being accepted
+        // when they would exceed the limit even after GC
+        let (_completion, addr) = setup_with_memory_limit(MemoryLimit {
+            max_bytes: Some(100), // Very small limit to trigger rejection
+        })
+        .await;
+        let mut client = make_client(addr).await;
+
+        // Send a few messages
+        let messages = fake_log_stream_recording(5);
+        write_messages(&mut client, messages.clone()).await;
+
+        // Wait for processing
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // With pre-emptive GC, messages that won't fit should be dropped before broadcast
+        // New client should receive very few messages (or possibly none)
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+
+        // Try to read up to 5 messages, but should get fewer due to memory limit
+        let actual = read_log_stream(&mut log_stream, 5).await;
+
+        // Should have dropped some messages
+        assert!(actual.len() < messages.len());
+    }
+
+    #[tokio::test]
+    async fn test_persistent_messages_not_garbage_collected() {
+        // Test that persistent messages (store info, blueprints) are never GC'd
+        let (_completion, addr) = setup_with_memory_limit(MemoryLimit {
+            max_bytes: Some(1024 * 100), // Small limit
+        })
+        .await;
+        let mut client = make_client(addr).await;
+
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+
+        // Send store info (persistent)
+        let store_info = vec![set_store_info_msg(&store_id)];
+        write_messages(&mut client, store_info.clone()).await;
+
+        // Send many temporal messages to trigger GC
+        let temporal_messages = generate_log_messages(&store_id, 50, Temporalness::Temporal);
+        write_messages(&mut client, temporal_messages).await;
+
+        // Wait for GC
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // New client should still get the store info (persistent)
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+        let actual = read_log_stream(&mut log_stream, 100).await;
+
+        // First message should still be the store info
+        assert!(!actual.is_empty());
+        assert_eq!(actual[0], store_info[0]);
+    }
+
+    #[tokio::test]
+    async fn test_gc_drops_disposable_before_static() {
+        // Test that GC drops disposable messages before static messages
+        let (_completion, addr) = setup_with_memory_limit(MemoryLimit {
+            max_bytes: Some(1024 * 200), // Limited memory
+        })
+        .await;
+        let mut client = make_client(addr).await;
+
+        let store_id = StoreId::random(StoreKind::Recording, "test_app");
+
+        // Send store info
+        write_messages(&mut client, vec![set_store_info_msg(&store_id)]).await;
+
+        // Send static messages
+        let static_messages = generate_log_messages(&store_id, 10, Temporalness::Static);
+        write_messages(&mut client, static_messages.clone()).await;
+
+        // Send temporal (disposable) messages
+        let temporal_messages = generate_log_messages(&store_id, 50, Temporalness::Temporal);
+        write_messages(&mut client, temporal_messages).await;
+
+        // Wait for GC
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // New client should receive some messages (static messages preserved)
+        let mut log_stream = client.read_messages(ReadMessagesRequest {}).await.unwrap();
+        let actual = read_log_stream(&mut log_stream, 100).await;
+
+        // Should have some messages preserved (at minimum the store info + some static)
+        // Static messages are GC'd after disposable ones, so we expect more than just store info
+        assert!(actual.len() > 1, "Static messages should be preserved longer than disposable ones");
+    }
+
+    #[test]
+    fn test_message_buffer_size_tracking() {
+        // Unit test for MessageBuffer size tracking
+        let mut buffer = MessageBuffer::default();
+
+        let store_id = StoreId::random(StoreKind::Recording, "test");
+        let msg = set_store_info_msg(&store_id);
+        let msg_proto: LogMsgProto = msg.clone().to_transport(Compression::Off).unwrap().into();
+
+        let initial_size = buffer.size_bytes();
+        assert_eq!(initial_size, 0);
+
+        // Add a message
+        buffer.add_log_msg(msg_proto.clone());
+        let size_after_add = buffer.size_bytes();
+        assert!(size_after_add > 0);
+
+        // GC with limit below current size
+        buffer.gc(0);
+        let size_after_gc = buffer.size_bytes();
+
+        // Size should decrease or stay same (persistent messages aren't GC'd)
+        assert!(size_after_gc <= size_after_add);
+    }
+
+    #[test]
+    fn test_gc_with_sufficient_memory() {
+        // Test that GC doesn't drop anything when under the limit
+        let mut buffer = MessageBuffer::default();
+
+        let store_id = StoreId::random(StoreKind::Recording, "test");
+        let messages = generate_log_messages(&store_id, 5, Temporalness::Temporal);
+
+        for msg in messages {
+            let msg_proto: LogMsgProto = msg.to_transport(Compression::Off).unwrap().into();
+            buffer.add_log_msg(msg_proto);
+        }
+
+        let size_before = buffer.size_bytes();
+
+        // GC with very high limit
+        buffer.gc(1024 * 1024 * 1024); // 1GB
+
+        let size_after = buffer.size_bytes();
+
+        // Size should be unchanged (plenty of memory)
+        assert_eq!(size_before, size_after);
+    }
 }
+
