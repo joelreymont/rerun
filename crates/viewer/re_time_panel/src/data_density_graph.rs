@@ -568,6 +568,7 @@ pub fn build_density_graph<'a>(
                     data.add_chunk_point(time, num_events as f32);
                 }
             } else if config.max_sampled_events_per_chunk > 0 {
+                // Sample to preserve time distribution while maintaining performance.
                 let events = chunk.num_events_cumulative_per_unique_time(timeline);
 
                 if events.len() > config.max_sampled_events_per_chunk {
@@ -583,7 +584,8 @@ pub fn build_density_graph<'a>(
                     }
                 }
             } else {
-                // Fall back to uniform distribution across the entire time range
+                // Sampling is explicitly disabled - fall back to uniform range distribution for performance.
+                // This is intentional for presets like NEVER_SHOW_INDIVIDUAL_EVENTS.
                 data.add_chunk_range(time_range, num_events_in_chunk);
             }
         }
