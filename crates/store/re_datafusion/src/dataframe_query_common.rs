@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatchOptions;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{Column, DataFusionError, downcast_value, exec_datafusion_err};
+use datafusion::common::stats::Statistics;
 use datafusion::datasource::TableType;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
@@ -49,6 +50,7 @@ pub struct DataframeQueryTableProvider {
     sort_index: Option<Index>,
     chunk_info_batches: Arc<Vec<RecordBatch>>,
     client: ConnectionClient,
+    statistics: Statistics,
 }
 
 impl DataframeQueryTableProvider {
@@ -143,7 +145,7 @@ impl DataframeQueryTableProvider {
             .map_err(|err| exec_datafusion_err!("{err}"))?
             .into_inner();
 
-        let chunk_info_batches = response_stream
+        let chunk_info_batches: Arc<Vec<RecordBatch>> = response_stream
             .collect::<Vec<_>>()
             .await
             .into_iter()
@@ -164,12 +166,19 @@ impl DataframeQueryTableProvider {
             ScanPartitionTableResponse::FIELD_PARTITION_ID,
         ));
 
+        // Compute statistics from chunk metadata
+        let statistics = crate::statistics::compute_statistics_from_chunks(
+            &schema,
+            &chunk_info_batches,
+        )?;
+
         Ok(Self {
             schema,
             query_expression: query_expression.to_owned(),
             sort_index: query_expression.filtered_index,
             chunk_info_batches,
             client,
+            statistics,
         })
     }
 
@@ -297,6 +306,24 @@ impl TableProvider for DataframeQueryTableProvider {
                 filters.len()
             ])
         }
+    }
+
+    /// Return table statistics for query optimization.
+    ///
+    /// Currently returns statistics with all values set to `Precision::Absent` because
+    /// the chunk metadata from `QueryDataset` doesn't include row counts, byte sizes,
+    /// or time ranges. This honestly tells DataFusion we don't have statistics available.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(statistics)` - Statistics with all `Precision::Absent` values
+    ///
+    /// # Performance
+    ///
+    /// Statistics are computed once during [`DataframeQueryTableProvider::new()`]
+    /// and cached, so this method is very cheap (just a clone).
+    fn statistics(&self) -> Option<Statistics> {
+        Some(self.statistics.clone())
     }
 }
 

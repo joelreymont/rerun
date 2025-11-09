@@ -10,6 +10,7 @@ mod dataset_manifest;
 mod grpc_streaming_provider;
 mod partition_table;
 mod search_provider;
+mod statistics;
 mod table_entry_provider;
 mod wasm_compat;
 
