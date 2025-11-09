@@ -56,3 +56,9 @@ pub static BLUEPRINT_TREE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Blueprint tree cache misses this frame
 pub static BLUEPRINT_TREE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// Visualizable entities cache hits this frame
+pub static VISUALIZABLE_ENTITIES_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Visualizable entities cache misses this frame
+pub static VISUALIZABLE_ENTITIES_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);

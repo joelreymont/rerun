@@ -119,12 +119,21 @@ impl VisualizableEntitiesCache {
             if cached.cache_key == current_key {
                 // Cache hit!
                 re_tracing::profile_scope!("visualizable_entities_cache_hit");
+
+                #[cfg(not(target_arch = "wasm32"))]
+                re_viewer_context::performance_metrics::VISUALIZABLE_ENTITIES_CACHE_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                 return PerVisualizer(cached.visualizable_entities.0.clone());
             }
         }
 
         // Cache miss - compute visualizable entities
         re_tracing::profile_scope!("visualizable_entities_cache_miss");
+
+        #[cfg(not(target_arch = "wasm32"))]
+        re_viewer_context::performance_metrics::VISUALIZABLE_ENTITIES_CACHE_MISSES
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let view_class = view.class(view_class_registry);
         let visualizers = view_class_registry.new_visualizer_collection(view.class_identifier());

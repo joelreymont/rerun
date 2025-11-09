@@ -192,6 +192,11 @@ impl BlueprintTree {
         let blueprint_tree_data = if self.cache_key.as_ref() == Some(&current_key) {
             // Cache hit - reuse existing tree data (cheap Arc clone)
             re_tracing::profile_scope!("blueprint_tree_cache_hit");
+
+            #[cfg(not(target_arch = "wasm32"))]
+            re_viewer_context::performance_metrics::BLUEPRINT_TREE_CACHE_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             self.cached_tree
                 .as_ref()
                 .expect("cache_key set but cached_tree is None")
@@ -199,6 +204,10 @@ impl BlueprintTree {
         } else {
             // Cache miss - rebuild tree data
             re_tracing::profile_scope!("blueprint_tree_cache_miss_rebuild");
+
+            #[cfg(not(target_arch = "wasm32"))]
+            re_viewer_context::performance_metrics::BLUEPRINT_TREE_CACHE_MISSES
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             let tree_data = BlueprintTreeData::from_blueprint_and_filter(
                 ctx,
