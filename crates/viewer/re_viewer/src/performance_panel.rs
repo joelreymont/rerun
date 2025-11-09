@@ -167,7 +167,8 @@ impl PerformancePanel {
 
     pub fn new() -> Self {
         // Automatically enable panel when profiling/tracing is active
-        let enabled = cfg!(feature = "perf_telemetry");
+        // Check at runtime if profiling is enabled, not just compile-time feature
+        let enabled = Self::is_profiling_active();
 
         Self {
             enabled,
@@ -184,8 +185,26 @@ impl PerformancePanel {
         }
     }
 
+    /// Check if profiling is currently active at runtime
+    fn is_profiling_active() -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Check if puffin profiling is active at runtime
+            re_tracing::reexports::puffin::are_scopes_on()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
     /// Call at start of frame
     pub fn begin_frame(&mut self) {
+        // Auto-enable panel if profiling was just turned on
+        if !self.enabled && Self::is_profiling_active() {
+            self.enabled = true;
+        }
+
         if !self.enabled || self.paused {
             return;
         }
