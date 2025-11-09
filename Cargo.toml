@@ -434,6 +434,14 @@ opt-level = 1 # Make debug builds run faster
 # Use the `debugging` profile (see below) if you need debug symbols.
 debug = false
 
+# Phase 5 Compile Time Optimizations:
+# Maximize parallelism for faster compilation (at cost of slightly slower runtime)
+# Default is 256, explicitly set for documentation
+codegen-units = 256
+
+# Keep incremental compilation enabled (default for dev, but explicit for clarity)
+incremental = true
+
 
 # Use the following command to grab the list of workspace crates:
 #   cargo metadata --no-deps --format-version 1 | jq '.packages[].name' | rg '"re_'

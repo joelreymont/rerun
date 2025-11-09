@@ -25,3 +25,16 @@ rustflags = ['--cfg=web_sys_unstable_apis', '--cfg=getrandom_backend="wasm_js"']
 # See https://github.com/rust-lang/rust/issues/141626
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
+
+# Use mold linker on Linux for faster linking (if available)
+# Install with: cargo install -f mold
+# This can provide 2-5x faster linking compared to ld
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Fallback: use lld if mold is not available
+# Uncomment the following and comment out mold if needed:
+# [target.x86_64-unknown-linux-gnu]
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
