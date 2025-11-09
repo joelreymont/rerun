@@ -17,8 +17,11 @@ use re_viewer_context::performance_metrics;
 
 /// Performance metrics collector and display
 pub struct PerformancePanel {
-    /// Whether panel is visible
+    /// Whether panel is enabled (tracking metrics)
     pub enabled: bool,
+
+    /// Whether the window is open/visible
+    pub open: bool,
 
     /// Data collection state
     pub paused: bool,
@@ -141,6 +144,31 @@ pub struct CacheStatistics {
     // Blueprint tree cache
     pub blueprint_tree_cache_hits: u64,
     pub blueprint_tree_cache_misses: u64,
+
+    // Visualizable entities cache
+    pub visualizable_entities_cache_hits: u64,
+    pub visualizable_entities_cache_misses: u64,
+}
+
+impl CacheStatistics {
+    /// Calculate overall cache hit rate as a percentage
+    fn total_hit_rate(&self) -> f64 {
+        let total_hits = self.query_cache_hits
+            + self.transform_cache_hits
+            + self.blueprint_tree_cache_hits
+            + self.visualizable_entities_cache_hits;
+        let total_accesses = total_hits
+            + self.query_cache_misses
+            + self.transform_cache_misses
+            + self.blueprint_tree_cache_misses
+            + self.visualizable_entities_cache_misses;
+
+        if total_accesses == 0 {
+            return 0.0;
+        }
+
+        (total_hits as f64 / total_accesses as f64) * 100.0
+    }
 }
 
 #[derive(Default)]
@@ -168,10 +196,11 @@ impl PerformancePanel {
     pub fn new() -> Self {
         // Automatically enable panel when profiling/tracing is active
         // Check at runtime if profiling is enabled, not just compile-time feature
-        let enabled = Self::is_profiling_active();
+        let is_profiling = Self::is_profiling_active();
 
         Self {
-            enabled,
+            enabled: is_profiling,
+            open: is_profiling,  // Auto-open window when profiling
             paused: false,
             frame_times: VecDeque::with_capacity(Self::WINDOW_SIZE),
             frame_start: None,
@@ -203,6 +232,7 @@ impl PerformancePanel {
         // Auto-enable panel if profiling was just turned on
         if !self.enabled && Self::is_profiling_active() {
             self.enabled = true;
+            self.open = true;  // Auto-open window
         }
 
         if !self.enabled || self.paused {
@@ -255,6 +285,11 @@ impl PerformancePanel {
                 performance_metrics::BLUEPRINT_TREE_CACHE_HITS.swap(0, Ordering::Relaxed);
             self.cache_stats.blueprint_tree_cache_misses =
                 performance_metrics::BLUEPRINT_TREE_CACHE_MISSES.swap(0, Ordering::Relaxed);
+
+            self.cache_stats.visualizable_entities_cache_hits =
+                performance_metrics::VISUALIZABLE_ENTITIES_CACHE_HITS.swap(0, Ordering::Relaxed);
+            self.cache_stats.visualizable_entities_cache_misses =
+                performance_metrics::VISUALIZABLE_ENTITIES_CACHE_MISSES.swap(0, Ordering::Relaxed);
         }
     }
 
@@ -301,7 +336,9 @@ impl PerformancePanel {
             return;
         }
 
-        egui::Window::new("⚡ Performance Metrics (Issue #8233)")
+        let mut open = self.open;
+        egui::Window::new("⚡ Performance Metrics")
+            .open(&mut open)  // Allow user to close, track state
             .default_pos([20.0, 100.0])
             .default_size([480.0, 700.0])
             .resizable(true)
@@ -309,6 +346,7 @@ impl PerformancePanel {
             .show(ctx, |ui| {
                 self.ui_impl(ui);
             });
+        self.open = open;
     }
 
     fn ui_impl(&mut self, ui: &mut Ui) {
@@ -328,65 +366,101 @@ impl PerformancePanel {
             if ui.button("🔄 Reset").clicked() {
                 self.reset();
             }
-
-            if self.baseline.is_some() {
-                if ui.button("Clear Baseline").clicked() {
-                    self.clear_baseline();
-                }
-            } else if ui.button("📊 Set Baseline").clicked() {
-                self.set_baseline();
-            }
         });
 
-        ui.add_space(5.0);
+        if self.frame_times.is_empty() {
+            ui.label("Collecting data...");
+            return;
+        }
 
-        // Session info
+        ui.separator();
+
+        // ========================================================================
+        // KEY STATUS INDICATOR - What you should look for
+        // ========================================================================
+
+        let p95_ms = self.percentile(0.95).as_secs_f64() * 1000.0;
+        let target_met = p95_ms < 16.7; // 60 FPS target
+
+        let cache_hit_rate = self.cache_stats.total_hit_rate();
+        let caches_effective = cache_hit_rate > 80.0;
+
         ui.horizontal(|ui| {
-            ui.label(format!(
-                "Session: {:.1}s",
-                self.session_start.elapsed().as_secs_f64()
-            ));
-            ui.label(format!("Frames: {}", self.total_frames));
-            if self.paused {
-                ui.colored_label(Color32::YELLOW, "⏸ PAUSED");
+            ui.heading("Status: ");
+            if target_met && caches_effective {
+                ui.colored_label(Color32::GREEN, RichText::new("✓ GOOD").heading());
+            } else {
+                ui.colored_label(Color32::YELLOW, RichText::new("⚠ NEEDS ATTENTION").heading());
             }
+        });
+
+        ui.add_space(8.0);
+
+        // ========================================================================
+        // KEY METRICS - The numbers that matter
+        // ========================================================================
+
+        ui.heading("📊 Key Metrics");
+        ui.add_space(4.0);
+
+        // Frame Time
+        ui.horizontal(|ui| {
+            ui.label("Frame Time (P95):");
+            let color = if target_met { Color32::GREEN } else { Color32::YELLOW };
+            ui.colored_label(color, RichText::new(format!("{:.1} ms", p95_ms)).strong());
+            if !target_met {
+                ui.label(format!("(target: <16.7 ms)"));
+            }
+        });
+
+        // Cache Effectiveness
+        ui.horizontal(|ui| {
+            ui.label("Cache Hit Rate:");
+            let color = if caches_effective { Color32::GREEN } else { Color32::YELLOW };
+            ui.colored_label(color, RichText::new(format!("{:.1}%", cache_hit_rate)).strong());
+            if !caches_effective {
+                ui.label("(target: >80%)");
+            }
+        });
+
+        // Bottleneck Phase
+        let bottleneck = self.phase_timings.bottleneck_phase();
+        let bottleneck_duration = self.phase_timings.total().as_secs_f64() * 1000.0;
+        ui.horizontal(|ui| {
+            ui.label("Slowest Phase:");
+            ui.colored_label(Color32::LIGHT_BLUE, RichText::new(bottleneck).strong());
+            ui.label(format!("({:.1} ms)", bottleneck_duration));
         });
 
         ui.separator();
 
-        // Main sections
-        ui.heading("Frame Time");
-        self.show_frame_times(ui);
+        // ========================================================================
+        // EXPANDABLE DETAILS
+        // ========================================================================
 
-        ui.add_space(10.0);
-        ui.separator();
+        egui::CollapsingHeader::new("📈 Frame Time Details")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.show_frame_times(ui);
+            });
 
-        ui.heading("Phase Breakdown");
-        self.show_phase_breakdown(ui);
+        egui::CollapsingHeader::new("⚙️ Phase Breakdown")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.show_phase_breakdown(ui);
+            });
 
-        ui.add_space(10.0);
-        ui.separator();
+        egui::CollapsingHeader::new("🎯 Cache Details")
+            .default_open(false)
+            .show(ui, |ui| {
+                self.show_cache_stats(ui);
+            });
 
-        ui.heading("Bottleneck Metrics");
-        self.show_bottleneck_metrics(ui);
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        ui.heading("Cache Effectiveness");
-        self.show_cache_stats(ui);
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        ui.heading("Memory Usage");
-        self.show_memory_stats(ui);
-
-        ui.add_space(10.0);
-        ui.separator();
-
-        ui.heading("Optimization Status");
-        self.show_optimization_status(ui);
+        ui.add_space(8.0);
+        ui.label(RichText::new("💡 What to look for:").strong());
+        ui.label("• Frame Time P95 should be < 16.7ms (60 FPS)");
+        ui.label("• Cache Hit Rate should be > 80%");
+        ui.label("• Focus optimization on the slowest phase");
     }
 
     fn show_frame_times(&self, ui: &mut Ui) {

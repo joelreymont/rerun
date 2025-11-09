@@ -3171,7 +3171,9 @@ impl eframe::App for App {
         {
             // Handle F12 keyboard shortcut to toggle panel
             if egui_ctx.input(|i| i.key_pressed(egui::Key::F12)) {
-                self.performance_panel.enabled = !self.performance_panel.enabled;
+                let new_state = !self.performance_panel.enabled;
+                self.performance_panel.enabled = new_state;
+                self.performance_panel.open = new_state;
             }
 
             // End frame tracking and show UI
