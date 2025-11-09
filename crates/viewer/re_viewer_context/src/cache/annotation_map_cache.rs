@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use re_chunk_store::{ChunkStoreEvent, LatestAtQuery};
@@ -8,30 +9,30 @@ use crate::{AnnotationMap, Cache, CacheMemoryReport, ViewerContext};
 
 /// Cache for annotation maps to avoid redundant loading within a frame.
 ///
-/// This cache stores a single annotation map per frame and is cleared at the beginning
-/// of each frame. The first access in a frame loads the annotation map, and all subsequent
-/// accesses reuse the cached version.
+/// This cache stores annotation maps per query (timeline + time) and is cleared at the
+/// beginning of each frame. Multiple views querying at different times will each get
+/// the correct annotations for their query.
 #[derive(Default)]
 pub struct AnnotationMapCache {
-    /// The cached annotation map for the current frame.
-    /// None means it hasn't been loaded yet this frame.
-    cached: Option<Arc<AnnotationMap>>,
+    /// Cached annotation maps, keyed by query.
+    /// Cleared at the beginning of each frame.
+    cached: HashMap<LatestAtQuery, Arc<AnnotationMap>>,
 }
 
 impl AnnotationMapCache {
-    /// Get or load the annotation map for the current frame.
+    /// Get or load the annotation map for the given query.
     pub fn get(&mut self, ctx: &ViewerContext<'_>, query: &LatestAtQuery) -> Arc<AnnotationMap> {
         re_tracing::profile_function!();
 
-        if let Some(cached) = &self.cached {
-            // Already loaded this frame, return cached version
+        if let Some(cached) = self.cached.get(query) {
+            // Already loaded for this query, return cached version
             cached.clone()
         } else {
-            // First access this frame, load and cache
+            // First access for this query, load and cache
             let mut annotation_map = AnnotationMap::default();
             annotation_map.load(ctx, query);
             let arc = Arc::new(annotation_map);
-            self.cached = Some(arc.clone());
+            self.cached.insert(query.clone(), arc.clone());
             arc
         }
     }
@@ -40,12 +41,12 @@ impl AnnotationMapCache {
 impl Cache for AnnotationMapCache {
     fn begin_frame(&mut self) {
         re_tracing::profile_function!();
-        // Clear the cache at the beginning of each frame to force a reload
-        self.cached = None;
+        // Clear all cached queries at the beginning of each frame
+        self.cached.clear();
     }
 
     fn purge_memory(&mut self) {
-        self.cached = None;
+        self.cached.clear();
     }
 
     fn name(&self) -> &'static str {
@@ -72,7 +73,7 @@ impl Cache for AnnotationMapCache {
         });
 
         if has_annotation_context_changes {
-            self.cached = None;
+            self.cached.clear();
         }
     }
 

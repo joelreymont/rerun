@@ -51,8 +51,8 @@ impl VisualizableEntitiesCacheKey {
 
             let mut hasher = DefaultHasher::new();
 
-            // Hash the visualizer IDs and their entity counts
-            // This is cheaper than hashing all entity paths
+            // Hash the visualizer IDs and all their entities
+            // We must hash all entities to avoid collisions between different entity sets
             let mut visualizers: Vec<_> = maybe_visualizable.0.iter().collect();
             visualizers.sort_by_key(|(id, _)| *id);
 
@@ -60,13 +60,11 @@ impl VisualizableEntitiesCacheKey {
                 Hash::hash(visualizer_id, &mut hasher);
                 entities.0.len().hash(&mut hasher);
 
-                // For small sets, hash the actual entities for better precision
-                if entities.0.len() < 100 {
-                    let mut sorted_entities: Vec<_> = entities.0.iter().collect();
-                    sorted_entities.sort();
-                    for entity in sorted_entities {
-                        Hash::hash(entity, &mut hasher);
-                    }
+                // Hash all entities for correctness
+                let mut sorted_entities: Vec<_> = entities.0.iter().collect();
+                sorted_entities.sort();
+                for entity in sorted_entities {
+                    Hash::hash(entity, &mut hasher);
                 }
             }
 
