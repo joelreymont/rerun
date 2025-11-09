@@ -1923,14 +1923,18 @@ fn copy_timeline_properties_context_menu(
     } else {
         let has_fragment = url.as_mut().is_ok_and(|url| {
             if let Some(fragment) = url.fragment_mut() {
-                fragment.when = Some((
-                    *time_ctrl.timeline().name(),
-                    re_log_types::TimeCell {
-                        typ: time_ctrl.time_type(),
-                        value: hovered_time.floor().into(),
-                    },
-                ));
-                true
+                if let Ok(value) = hovered_time.floor().try_into() {
+                    fragment.when = Some((
+                        *time_ctrl.timeline().name(),
+                        re_log_types::TimeCell {
+                            typ: time_ctrl.time_type(),
+                            value,
+                        },
+                    ));
+                    true
+                } else {
+                    false
+                }
             } else {
                 false
             }

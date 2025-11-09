@@ -688,7 +688,7 @@ impl App {
                                 *time_ctrl.timeline().name(),
                                 re_log_types::TimeCell {
                                     typ: time_ctrl.time_type(),
-                                    value: time_ctrl.last_paused_time()?.floor().into(),
+                                    value: time_ctrl.last_paused_time()?.floor().try_into().ok()?,
                                 },
                             ))
                         });

@@ -227,7 +227,7 @@ impl ViewerOpenUrl {
                     *time_ctrl.timeline().name(),
                     re_log_types::TimeCell {
                         typ: time_ctrl.time_type(),
-                        value: time.into(),
+                        value: time.try_into().ok()?,
                     },
                 ))
             });
