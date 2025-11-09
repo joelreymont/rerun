@@ -106,6 +106,9 @@ pub struct App {
     memory_panel: crate::memory_panel::MemoryPanel,
     memory_panel_open: bool,
 
+    #[cfg(not(target_arch = "wasm32"))]
+    performance_panel: crate::performance_panel::PerformancePanel,
+
     egui_debug_panel_open: bool,
 
     /// Last time the latency was deemed interesting.
@@ -406,6 +409,9 @@ impl App {
 
             memory_panel: Default::default(),
             memory_panel_open: false,
+
+            #[cfg(not(target_arch = "wasm32"))]
+            performance_panel: crate::performance_panel::PerformancePanel::new(),
 
             egui_debug_panel_open: false,
 
@@ -2898,6 +2904,10 @@ impl eframe::App for App {
         #[cfg(all(not(target_arch = "wasm32"), feature = "perf_telemetry"))]
         re_perf_telemetry::external::tracing_tracy::client::frame_mark();
 
+        // Begin performance panel frame tracking
+        #[cfg(not(target_arch = "wasm32"))]
+        self.performance_panel.begin_frame();
+
         if let Some(seconds) = frame.info().cpu_usage {
             self.frame_time_history
                 .add(egui_ctx.input(|i| i.time), seconds);
@@ -3155,6 +3165,19 @@ impl eframe::App for App {
 
         // Return the `StoreHub` to the Viewer so we have it on the next frame
         self.store_hub = Some(store_hub);
+
+        // Performance panel integration
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Handle F12 keyboard shortcut to toggle panel
+            if egui_ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+                self.performance_panel.enabled = !self.performance_panel.enabled;
+            }
+
+            // End frame tracking and show UI
+            self.performance_panel.end_frame();
+            self.performance_panel.ui(egui_ctx);
+        }
 
         {
             // Check for returned screenshots:
