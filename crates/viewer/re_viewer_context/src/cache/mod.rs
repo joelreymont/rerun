@@ -3,6 +3,7 @@
 //! Caches are registered lazily upon first use, see [`Caches::entry`].
 //! The concrete caches exposed here are always available for all viewer crates.
 
+mod annotation_map_cache;
 mod caches;
 mod image_decode_cache;
 mod image_stats_cache;
@@ -10,6 +11,7 @@ mod tensor_stats_cache;
 mod video_asset_cache;
 mod video_stream_cache;
 
+pub use annotation_map_cache::AnnotationMapCache;
 pub use caches::{Cache, CacheMemoryReport, CacheMemoryReportItem, Caches};
 
 // TODO(andreas): Do we _really_ have to have all these caches in `re_viewer_context`?

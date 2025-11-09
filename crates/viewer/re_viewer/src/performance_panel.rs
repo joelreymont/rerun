@@ -3,11 +3,13 @@
 //! Provides real-time bottleneck tracking and optimization progress monitoring.
 
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui::{Color32, RichText, Ui};
 use web_time::Instant;
+
+use re_viewer_context::performance_metrics;
 
 // ============================================================================
 // Main Panel Structure
@@ -203,6 +205,34 @@ impl PerformancePanel {
             }
 
             self.total_frames += 1;
+
+            // Collect bottleneck metrics from atomics
+            self.bottleneck_metrics.annotation_loads_per_frame =
+                performance_metrics::ANNOTATION_LOADS_THIS_FRAME.swap(0, Ordering::Relaxed);
+            self.bottleneck_metrics.entity_tree_walks_per_frame =
+                performance_metrics::ENTITY_TREE_WALKS_THIS_FRAME.swap(0, Ordering::Relaxed);
+            self.bottleneck_metrics.transform_invalidations_per_frame =
+                performance_metrics::TRANSFORM_INVALIDATIONS_THIS_FRAME.swap(0, Ordering::Relaxed);
+            self.bottleneck_metrics.blueprint_tree_rebuilds_per_frame =
+                performance_metrics::BLUEPRINT_TREE_REBUILDS_THIS_FRAME.swap(0, Ordering::Relaxed);
+            self.bottleneck_metrics.query_traversals_per_frame =
+                performance_metrics::QUERY_TRAVERSALS_THIS_FRAME.swap(0, Ordering::Relaxed);
+
+            // Collect cache statistics
+            self.cache_stats.query_cache_hits =
+                performance_metrics::QUERY_CACHE_HITS.swap(0, Ordering::Relaxed);
+            self.cache_stats.query_cache_misses =
+                performance_metrics::QUERY_CACHE_MISSES.swap(0, Ordering::Relaxed);
+
+            self.cache_stats.transform_cache_hits =
+                performance_metrics::TRANSFORM_CACHE_HITS.swap(0, Ordering::Relaxed);
+            self.cache_stats.transform_cache_misses =
+                performance_metrics::TRANSFORM_CACHE_MISSES.swap(0, Ordering::Relaxed);
+
+            self.cache_stats.blueprint_tree_cache_hits =
+                performance_metrics::BLUEPRINT_TREE_CACHE_HITS.swap(0, Ordering::Relaxed);
+            self.cache_stats.blueprint_tree_cache_misses =
+                performance_metrics::BLUEPRINT_TREE_CACHE_MISSES.swap(0, Ordering::Relaxed);
         }
     }
 
@@ -741,21 +771,8 @@ impl PerformancePanel {
 // ============================================================================
 // Global Metrics Collection (Thread-safe atomics)
 // ============================================================================
-
-// Bottleneck metrics (reset each frame)
-pub static ANNOTATION_LOADS_THIS_FRAME: AtomicU64 = AtomicU64::new(0);
-pub static ENTITY_TREE_WALKS_THIS_FRAME: AtomicU64 = AtomicU64::new(0);
-pub static TRANSFORM_INVALIDATIONS_THIS_FRAME: AtomicU64 = AtomicU64::new(0);
-pub static BLUEPRINT_TREE_REBUILDS_THIS_FRAME: AtomicU64 = AtomicU64::new(0);
-pub static QUERY_TRAVERSALS_THIS_FRAME: AtomicU64 = AtomicU64::new(0);
-
-// Cache metrics (reset each frame)
-pub static QUERY_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-pub static QUERY_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-pub static TRANSFORM_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-pub static TRANSFORM_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-pub static BLUEPRINT_TREE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-pub static BLUEPRINT_TREE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+// Note: All atomic counters are now defined in re_viewer_context::performance_metrics
+// and imported above.
 
 #[cfg(test)]
 mod tests {
