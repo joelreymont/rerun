@@ -243,6 +243,9 @@ rerun-build-web-release = "rustup target add wasm32-unknown-unknown && cargo run
 
 rs-check = "python scripts/ci/rust_checks.py"
 
+# Track compilation times for performance monitoring
+track-compile-times = "python scripts/ci/track_compile_times.py"
+
 # Check that old .rrd files can still be read and understood.
 # See tests/assets/rrd/README.md for more.
 check-backwards-compatibility = { cmd = "find tests/assets/rrd -name '*.rrd' -type f -print0 | xargs -0 cargo run --package rerun-cli --no-default-features --quiet rrd verify" }

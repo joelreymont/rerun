@@ -1,0 +1,97 @@
+name: Track Compile Times
+
+on:
+  push:
+    branches:
+      - main
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+concurrency:
+  group: track-compile-times-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUSTFLAGS: --deny warnings
+  RUSTDOCFLAGS: --deny warnings
+
+  # Disable the GHA backend (Github's 10GB storage) since we use our own GCS backend.
+  # See: https://github.com/marketplace/actions/sccache-action
+  SCCACHE_GHA_ENABLED: "false"
+
+  # Wrap every `rustc` invocation in `sccache`.
+  RUSTC_WRAPPER: "sccache"
+
+  # Not only `sccache` cannot cache incremental builds, it's counter-productive to generate all
+  # these incremental artifacts when running on CI.
+  CARGO_INCREMENTAL: "0"
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+permissions:
+  contents: "read"
+  id-token: "write"
+
+jobs:
+  track-compile-times:
+    name: Track Rust compilation times
+    timeout-minutes: 60
+    runs-on: ubuntu-22.04-large
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache_key: "build-linux"
+          save_cache: false
+          workload_identity_provider: ${{ secrets.GOOGLE_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+
+      - uses: prefix-dev/setup-pixi@v0.9.1
+        with:
+          pixi-version: v0.55.0
+
+      - name: Track clean build time
+        run: |
+          pixi run track-compile-times --clean --output ci-metrics
+
+      - name: Track incremental build time (rerun package)
+        run: |
+          # Touch a file to force rebuild of a single package
+          touch crates/top/rerun/src/lib.rs
+          pixi run track-compile-times --package rerun --output ci-metrics
+
+      - name: Upload timing reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: compile-time-reports
+          path: |
+            ci-metrics/
+            target/cargo-timings/*.html
+          retention-days: 90
+
+      - name: Display timing summary
+        if: always()
+        run: |
+          echo "## Compilation Time Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f ci-metrics/compile_times.jsonl ]; then
+            echo "### Recent builds:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Build Type | Duration | Timestamp |" >> $GITHUB_STEP_SUMMARY
+            echo "|-----------|----------|-----------|" >> $GITHUB_STEP_SUMMARY
+            tail -10 ci-metrics/compile_times.jsonl | while IFS= read -r line; do
+              duration=$(echo "$line" | python3 -c "import sys, json; print(f\"{json.load(sys.stdin)['duration_seconds']:.2f}\")")
+              build_type=$(echo "$line" | python3 -c "import sys, json; d=json.load(sys.stdin); print(f\"{d['package']} ({'clean' if d['clean_build'] else 'incremental'})\")")
+              timestamp=$(echo "$line" | python3 -c "import sys, json; print(json.load(sys.stdin)['timestamp'])")
+              echo "| $build_type | ${duration}s | $timestamp |" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Timing HTML reports are available in the workflow artifacts." >> $GITHUB_STEP_SUMMARY
