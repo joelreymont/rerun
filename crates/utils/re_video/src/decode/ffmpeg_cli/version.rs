@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf, task::Poll};
+use std::{collections::HashMap, path::PathBuf, task::Poll, time::{Duration, Instant}};
 
 use parking_lot::Mutex;
 use poll_promise::Promise;
@@ -83,13 +83,19 @@ impl FFmpegVersion {
     /// version string. Since version strings can get pretty wild, we don't want to fail in this case.
     ///
     /// Internally caches the result per path together with its modification time to re-run/parse the version only if the file has changed.
+    ///
+    /// Note: This function contains a BLOCKING I/O operation (file metadata check).
     pub fn for_executable_poll(path: Option<&std::path::Path>) -> Poll<FfmpegVersionResult> {
         re_tracing::profile_function!();
 
-        let modification_time = file_modification_time(path)?;
+        let modification_time = match file_modification_time_blocking(path) {
+            Ok(mtime) => mtime,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+
         VersionCache::global(|cache| {
             cache
-                .version(path, modification_time)
+                .version_blocking(path, modification_time)
                 .poll()
                 .map(|r| r.clone())
         })
@@ -99,16 +105,66 @@ impl FFmpegVersion {
     ///
     /// WARNING: this can block for SEVEN SECONDS on Mac, but usually only the first time
     /// after a reboot. NEVER call this on the GUI thread!
+    ///
+    /// This function has the `_blocking` suffix to indicate it performs blocking operations.
     pub fn for_executable_blocking(path: Option<&std::path::Path>) -> FfmpegVersionResult {
         re_tracing::profile_function!();
 
-        let modification_time = file_modification_time(path)?;
-        VersionCache::global(|cache| {
-            cache
-                .version(path, modification_time)
-                .block_until_ready()
-                .clone()
-        })
+        let start = Instant::now();
+
+        let modification_time = {
+            re_tracing::profile_scope!("file_modification_time_blocking");
+            file_modification_time_blocking(path)?
+        };
+
+        let result = {
+            re_tracing::profile_scope!("version_cache_access");
+            VersionCache::global(|cache| {
+                cache
+                    .version_blocking(path, modification_time)
+                    .block_until_ready()
+                    .clone()
+            })
+        };
+
+        let elapsed = start.elapsed();
+        if elapsed.as_millis() > 100 {
+            re_log::warn!(
+                "FFmpeg version check took {:?} (path: {:?}). \
+                This is expected on first run after reboot on macOS (can take up to 7 seconds), \
+                but may indicate performance issues on other platforms.",
+                elapsed,
+                path
+            );
+        }
+
+        result
+    }
+
+    /// Like [`Self::for_executable_blocking`], but with a timeout.
+    ///
+    /// Returns `Err` if the version check takes longer than the specified timeout.
+    /// This provides graceful degradation when FFmpeg version checking is slow.
+    ///
+    /// This function has the `_blocking` suffix to indicate it performs blocking operations.
+    pub fn for_executable_blocking_with_timeout(
+        path: Option<&std::path::Path>,
+        timeout: Duration,
+    ) -> Result<FfmpegVersionResult, TimeoutError> {
+        use std::sync::mpsc::channel;
+
+        let (tx, rx) = channel();
+        let path_buf = path.map(|p| p.to_path_buf());
+
+        std::thread::spawn(move || {
+            let result = Self::for_executable_blocking(path_buf.as_deref());
+            let _ = tx.send(result);
+        });
+
+        rx.recv_timeout(timeout)
+            .map_err(|_| TimeoutError::VersionCheckTimedOut {
+                timeout_duration: timeout,
+            })
     }
 
     /// Returns true if this version is compatible with Rerun's minimum requirements.
@@ -119,9 +175,20 @@ impl FFmpegVersion {
     }
 }
 
-fn file_modification_time(
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum TimeoutError {
+    #[error("FFmpeg version check timed out after {timeout_duration:?}")]
+    VersionCheckTimedOut { timeout_duration: Duration },
+}
+
+/// Get file modification time (BLOCKING I/O operation).
+///
+/// WARNING: This performs blocking filesystem I/O and should not be called on the GUI thread!
+fn file_modification_time_blocking(
     path: Option<&std::path::Path>,
 ) -> Result<Option<std::time::SystemTime>, FFmpegVersionParseError> {
+    re_tracing::profile_function!();
+
     Ok(if let Some(path) = path {
         path.metadata()
             .map_err(|err| {
@@ -144,13 +211,20 @@ struct VersionCache(
 );
 
 impl VersionCache {
+    /// Access the global cache (uses Mutex for thread-safe access).
+    ///
+    /// Note: This acquires a mutex lock which may block if another thread is accessing the cache.
     fn global<R>(f: impl FnOnce(&mut Self) -> R) -> R {
+        re_tracing::profile_scope!("version_cache_lock");
         static CACHE: std::sync::LazyLock<Mutex<VersionCache>> =
             std::sync::LazyLock::new(|| Mutex::new(VersionCache::default()));
         f(&mut CACHE.lock())
     }
 
-    fn version(
+    /// Get version, blocking until ready (may insert new entry if not cached).
+    ///
+    /// This function has `_blocking` suffix to indicate it performs blocking operations.
+    fn version_blocking(
         &mut self,
         path: Option<&std::path::Path>,
         modification_time: Option<std::time::SystemTime>,
@@ -160,21 +234,60 @@ impl VersionCache {
         let cache_key = path.unwrap_or(std::path::Path::new("ffmpeg")).to_path_buf();
 
         match cache.entry(cache_key) {
-            std::collections::hash_map::Entry::Occupied(entry) => &entry.into_mut().1,
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let (cached_mtime, _) = entry.get();
+                // Invalidate cache if the executable's modification time has changed
+                if *cached_mtime != modification_time {
+                    re_log::debug!(
+                        "FFmpeg executable modification time changed, invalidating cache for {:?}",
+                        path
+                    );
+                    let path = path.map(|path| path.to_path_buf());
+                    let version = Promise::spawn_thread("ffmpeg_version", move || {
+                        ffmpeg_version_blocking(path.as_ref())
+                    });
+                    let _ = entry.insert((modification_time, version));
+                }
+                &entry.into_mut().1
+            }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let path = path.map(|path| path.to_path_buf());
                 let version =
-                    Promise::spawn_thread("ffmpeg_version", move || ffmpeg_version(path.as_ref()));
+                    Promise::spawn_thread("ffmpeg_version", move || ffmpeg_version_blocking(path.as_ref()));
                 &entry.insert((modification_time, version)).1
             }
         }
     }
 }
 
-fn ffmpeg_version(
+/// Pre-warm the FFmpeg version cache by checking the version in a background thread.
+///
+/// Call this during application initialization to avoid the 7-second delay on first video load.
+/// This function returns immediately and performs the check asynchronously.
+pub fn warmup_version_cache() {
+    std::thread::spawn(|| {
+        re_tracing::profile_function!();
+        // This blocks, but on a background thread during startup
+        let result = FFmpegVersion::for_executable_blocking(None);
+        match result {
+            Ok(version) => {
+                re_log::debug!("FFmpeg version cache pre-warmed successfully: {}", version);
+            }
+            Err(err) => {
+                re_log::debug!("FFmpeg version cache pre-warm failed (this is okay): {:?}", err);
+            }
+        }
+    });
+}
+
+/// Get FFmpeg version by spawning ffmpeg process (BLOCKING operation).
+///
+/// WARNING: Can block for SEVEN SECONDS on Mac after reboot!
+/// This function has the `_blocking` suffix to indicate it performs blocking operations.
+fn ffmpeg_version_blocking(
     path: Option<&std::path::PathBuf>,
 ) -> Result<FFmpegVersion, FFmpegVersionParseError> {
-    re_tracing::profile_function!("ffmpeg_version_with_path");
+    re_tracing::profile_function!();
 
     // Don't use sidecar's ffmpeg_version_with_path/ffmpeg_version directly since the error message for
     // file not found isn't great and we want this for display in the UI.

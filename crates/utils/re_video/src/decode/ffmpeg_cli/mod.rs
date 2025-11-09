@@ -3,8 +3,8 @@ mod version;
 
 pub use ffmpeg::{Error, FFmpegCliDecoder};
 pub use version::{
-    FFMPEG_MINIMUM_VERSION_MAJOR, FFMPEG_MINIMUM_VERSION_MINOR, FFmpegVersion,
-    FFmpegVersionParseError,
+    warmup_version_cache, FFMPEG_MINIMUM_VERSION_MAJOR, FFMPEG_MINIMUM_VERSION_MINOR,
+    FFmpegVersion, FFmpegVersionParseError, TimeoutError,
 };
 
 /// Download URL for the latest version of `FFmpeg` on the current platform.
