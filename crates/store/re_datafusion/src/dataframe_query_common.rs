@@ -221,6 +221,232 @@ impl DataframeQueryTableProvider {
             .map(|expr| Self::is_neq_null(expr).and_then(Self::selector_from_column))
             .collect()
     }
+
+    /// Check if a column is the rerun_partition_id column
+    fn is_partition_id_column(col: &Column) -> bool {
+        col.name() == ScanPartitionTableResponse::FIELD_PARTITION_ID
+    }
+
+    /// Check if filters contain conflicting partition_id equality constraints.
+    /// Returns true if there are multiple == filters with different values,
+    /// which would be impossible to satisfy (x == "A" AND x == "B" is always false).
+    fn has_conflicting_partition_equality_filters(filters: &[&Expr]) -> bool {
+        let mut eq_values = BTreeSet::new();
+        let mut found_multiple_eq = false;
+
+        for expr in filters {
+            if let Expr::BinaryExpr(binary) = expr {
+                if binary.op == Operator::Eq {
+                    if let (Expr::Column(col), Expr::Literal(sv, _))
+                        | (Expr::Literal(sv, _), Expr::Column(col)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
+                        if Self::is_partition_id_column(col) {
+                            if let Some(Some(s)) = sv.try_as_str() {
+                                if !eq_values.insert(s.to_owned()) {
+                                    // Value already exists - this is OK (idempotent)
+                                    continue;
+                                }
+                                if eq_values.len() > 1 {
+                                    // Multiple different values - conflict!
+                                    found_multiple_eq = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        found_multiple_eq
+    }
+
+    /// Extract partition IDs from filter expressions.
+    /// Returns (include_ids, exclude_ids) where:
+    /// - include_ids: partition IDs to include (from == or IN)
+    /// - exclude_ids: partition IDs to exclude (from != or NOT IN)
+    fn extract_partition_id_filters(
+        filters: &[&Expr],
+    ) -> (BTreeSet<String>, BTreeSet<String>) {
+        let mut include_ids = BTreeSet::new();
+        let mut exclude_ids = BTreeSet::new();
+
+        for expr in filters {
+            match expr {
+                // Handle: partition_id == "value" or "value" == partition_id
+                Expr::BinaryExpr(binary) if binary.op == Operator::Eq => {
+                    if let (Expr::Column(col), Expr::Literal(sv, _))
+                        | (Expr::Literal(sv, _), Expr::Column(col)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
+                        if Self::is_partition_id_column(col) {
+                            if let Some(Some(s)) = sv.try_as_str() {
+                                include_ids.insert(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                // Handle: partition_id != "value" or "value" != partition_id
+                Expr::BinaryExpr(binary) if binary.op == Operator::NotEq => {
+                    if let (Expr::Column(col), Expr::Literal(sv, _))
+                        | (Expr::Literal(sv, _), Expr::Column(col)) =
+                        (binary.left.as_ref(), binary.right.as_ref())
+                    {
+                        if Self::is_partition_id_column(col) {
+                            if let Some(Some(s)) = sv.try_as_str() {
+                                exclude_ids.insert(s.to_owned());
+                            }
+                        }
+                    }
+                }
+                // Handle: partition_id IN ("val1", "val2", ...)
+                Expr::InList(in_list) => {
+                    if let Expr::Column(col) = in_list.expr.as_ref() {
+                        if Self::is_partition_id_column(col) {
+                            for item in &in_list.list {
+                                if let Expr::Literal(sv, _) = item {
+                                    if let Some(Some(s)) = sv.try_as_str() {
+                                        if in_list.negated {
+                                            exclude_ids.insert(s.to_owned());
+                                        } else {
+                                            include_ids.insert(s.to_owned());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Handle: NOT (partition_id == "value")
+                Expr::Not(inner) => {
+                    if let Expr::BinaryExpr(binary) = inner.as_ref() {
+                        if binary.op == Operator::Eq {
+                            if let (Expr::Column(col), Expr::Literal(sv, _))
+                                | (Expr::Literal(sv, _), Expr::Column(col)) =
+                                (binary.left.as_ref(), binary.right.as_ref())
+                            {
+                                if Self::is_partition_id_column(col) {
+                                    if let Some(Some(s)) = sv.try_as_str() {
+                                        exclude_ids.insert(s.to_owned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (include_ids, exclude_ids)
+    }
+
+    /// Check if a filter expression is a partition_id filter that we support
+    fn is_supported_partition_id_filter(expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(binary) if matches!(binary.op, Operator::Eq | Operator::NotEq) => {
+                if let (Expr::Column(col), Expr::Literal(sv, _))
+                    | (Expr::Literal(sv, _), Expr::Column(col)) =
+                    (binary.left.as_ref(), binary.right.as_ref())
+                {
+                    // Only support if column is partition_id AND literal is a valid string
+                    Self::is_partition_id_column(col) && sv.try_as_str().is_some_and(|s| s.is_some())
+                } else {
+                    false
+                }
+            }
+            Expr::InList(in_list) => {
+                if let Expr::Column(col) = in_list.expr.as_ref() {
+                    // Only support if column is partition_id AND all list items are valid strings
+                    if !Self::is_partition_id_column(col) {
+                        return false;
+                    }
+                    // Verify all list items are string literals
+                    in_list.list.iter().all(|item| {
+                        if let Expr::Literal(sv, _) = item {
+                            sv.try_as_str().is_some_and(|s| s.is_some())
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                }
+            }
+            Expr::Not(inner) => {
+                if let Expr::BinaryExpr(binary) = inner.as_ref() {
+                    if binary.op == Operator::Eq {
+                        if let (Expr::Column(col), Expr::Literal(sv, _))
+                            | (Expr::Literal(sv, _), Expr::Column(col)) =
+                            (binary.left.as_ref(), binary.right.as_ref())
+                        {
+                            // Only support if column is partition_id AND literal is a valid string
+                            return Self::is_partition_id_column(col) && sv.try_as_str().is_some_and(|s| s.is_some());
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Filter chunk_info_batches by partition ID based on include/exclude sets
+    fn filter_chunk_batches_by_partition(
+        &self,
+        include_ids: &BTreeSet<String>,
+        exclude_ids: &BTreeSet<String>,
+    ) -> Result<Arc<Vec<RecordBatch>>, DataFusionError> {
+        let mut filtered_batches = Vec::new();
+
+        for batch in self.chunk_info_batches.as_ref() {
+            let partition_ids = batch
+                .column_by_name("chunk_partition_id")
+                .ok_or(exec_datafusion_err!(
+                    "Unable to find chunk_partition_id column"
+                ))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(exec_datafusion_err!(
+                    "chunk_partition_id must be string type"
+                ))?;
+
+            // Collect indices of rows that match the filter
+            let mut matching_indices = Vec::new();
+            for (row_idx, partition_id) in partition_ids.iter().enumerate() {
+                let pid = partition_id.ok_or(exec_datafusion_err!(
+                    "Found null partition_id in chunk_partition_id column at row {row_idx}"
+                ))?;
+
+                let matches = if !include_ids.is_empty() {
+                    // If include_ids is set, only include rows in the set
+                    include_ids.contains(pid)
+                } else {
+                    // If no include_ids, include everything by default
+                    true
+                };
+
+                let excluded = exclude_ids.contains(pid);
+
+                // Include if matches and not excluded
+                if matches && !excluded {
+                    matching_indices.push(row_idx);
+                }
+            }
+
+            // If we have matching rows, create a filtered batch
+            if !matching_indices.is_empty() {
+                let indices = arrow::array::UInt32Array::from(
+                    matching_indices.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+                );
+                let filtered_batch = arrow::compute::take_record_batch(batch, &indices)?;
+                filtered_batches.push(filtered_batch);
+            }
+        }
+
+        Ok(Arc::new(filtered_batches))
+    }
 }
 
 #[async_trait]
@@ -249,20 +475,31 @@ impl TableProvider for DataframeQueryTableProvider {
 
         // Find the first column selection that is a component
         if query_expression.filtered_is_not_null.is_none() {
-            let filters = filters.iter().collect::<Vec<_>>();
+            let filters_ref = filters.iter().collect::<Vec<_>>();
             query_expression.filtered_is_not_null =
-                Self::compute_column_is_neq_null_filter(&filters)
+                Self::compute_column_is_neq_null_filter(&filters_ref)
                     .into_iter()
                     .flatten()
                     .next();
         }
+
+        // Extract partition_id filters from DataFusion filter expressions
+        let filters_ref = filters.iter().collect::<Vec<_>>();
+        let (include_ids, exclude_ids) = Self::extract_partition_id_filters(&filters_ref);
+
+        // Filter chunk_info_batches based on partition_id filters
+        let chunk_info_batches = if !include_ids.is_empty() || !exclude_ids.is_empty() {
+            self.filter_chunk_batches_by_partition(&include_ids, &exclude_ids)?
+        } else {
+            Arc::clone(&self.chunk_info_batches)
+        };
 
         crate::PartitionStreamExec::try_new(
             &self.schema,
             self.sort_index,
             projection,
             state.config().target_partitions(),
-            Arc::clone(&self.chunk_info_batches),
+            chunk_info_batches,
             query_expression,
             self.client.clone(),
         )
@@ -277,14 +514,24 @@ impl TableProvider for DataframeQueryTableProvider {
         &self,
         filters: &[&Expr],
     ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        // Check for conflicting partition_id equality filters
+        // (e.g., partition_id == "A" AND partition_id == "B" is impossible)
+        let has_conflicts = Self::has_conflicting_partition_equality_filters(filters);
+
         let filter_columns = Self::compute_column_is_neq_null_filter(filters);
         let non_null_columns = filter_columns.iter().flatten().collect::<Vec<_>>();
+
+        // Check for component column filters (existing logic)
         if let Some(col) = non_null_columns.first() {
             let col = *col;
             Ok(filter_columns
                 .iter()
-                .map(|filter| {
+                .enumerate()
+                .map(|(i, filter)| {
                     if Some(col) == filter.as_ref() {
+                        TableProviderFilterPushDown::Exact
+                    } else if !has_conflicts && Self::is_supported_partition_id_filter(filters[i]) {
+                        // Support partition_id filters only if no conflicts
                         TableProviderFilterPushDown::Exact
                     } else {
                         TableProviderFilterPushDown::Unsupported
@@ -292,10 +539,17 @@ impl TableProvider for DataframeQueryTableProvider {
                 })
                 .collect::<Vec<_>>())
         } else {
-            Ok(vec![
-                TableProviderFilterPushDown::Unsupported;
-                filters.len()
-            ])
+            // No component filters, but check for partition_id filters
+            Ok(filters
+                .iter()
+                .map(|filter| {
+                    if !has_conflicts && Self::is_supported_partition_id_filter(filter) {
+                        TableProviderFilterPushDown::Exact
+                    } else {
+                        TableProviderFilterPushDown::Unsupported
+                    }
+                })
+                .collect::<Vec<_>>())
         }
     }
 }
@@ -519,8 +773,194 @@ mod tests {
     use std::collections::HashMap;
 
     use arrow::array::{Array as _, FixedSizeBinaryArray, FixedSizeBinaryBuilder};
+    use datafusion::logical_expr::expr::InList;
 
     use super::*;
+
+    #[test]
+    fn test_partition_id_filter_extraction_equality() {
+        use datafusion::logical_expr::lit;
+
+        // Test: partition_id == "partition1"
+        let filter = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::Eq,
+            right: Box::new(lit("partition1")),
+        });
+
+        let (include, exclude) = DataframeQueryTableProvider::extract_partition_id_filters(&[&filter]);
+
+        assert_eq!(include.len(), 1);
+        assert!(include.contains("partition1"));
+        assert_eq!(exclude.len(), 0);
+    }
+
+    #[test]
+    fn test_partition_id_filter_extraction_inequality() {
+        use datafusion::logical_expr::lit;
+
+        // Test: partition_id != "partition1"
+        let filter = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::NotEq,
+            right: Box::new(lit("partition1")),
+        });
+
+        let (include, exclude) = DataframeQueryTableProvider::extract_partition_id_filters(&[&filter]);
+
+        assert_eq!(include.len(), 0);
+        assert_eq!(exclude.len(), 1);
+        assert!(exclude.contains("partition1"));
+    }
+
+    #[test]
+    fn test_partition_id_filter_extraction_in_list() {
+        use datafusion::logical_expr::lit;
+
+        // Test: partition_id IN ["partition1", "partition2"]
+        let filter = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            list: vec![lit("partition1"), lit("partition2")],
+            negated: false,
+        });
+
+        let (include, exclude) = DataframeQueryTableProvider::extract_partition_id_filters(&[&filter]);
+
+        assert_eq!(include.len(), 2);
+        assert!(include.contains("partition1"));
+        assert!(include.contains("partition2"));
+        assert_eq!(exclude.len(), 0);
+    }
+
+    #[test]
+    fn test_partition_id_filter_extraction_not_in_list() {
+        use datafusion::logical_expr::lit;
+
+        // Test: partition_id NOT IN ["partition1", "partition2"]
+        let filter = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            list: vec![lit("partition1"), lit("partition2")],
+            negated: true,
+        });
+
+        let (include, exclude) = DataframeQueryTableProvider::extract_partition_id_filters(&[&filter]);
+
+        assert_eq!(include.len(), 0);
+        assert_eq!(exclude.len(), 2);
+        assert!(exclude.contains("partition1"));
+        assert!(exclude.contains("partition2"));
+    }
+
+    #[test]
+    fn test_partition_id_filter_is_supported() {
+        use datafusion::logical_expr::lit;
+
+        // Test equality filter with string literal - should be supported
+        let eq_filter = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::Eq,
+            right: Box::new(lit("partition1")),
+        });
+        assert!(DataframeQueryTableProvider::is_supported_partition_id_filter(&eq_filter));
+
+        // Test non-partition column filter - should NOT be supported
+        let other_filter = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(None::<String>, "other_column"))),
+            op: Operator::Eq,
+            right: Box::new(lit("value")),
+        });
+        assert!(!DataframeQueryTableProvider::is_supported_partition_id_filter(&other_filter));
+
+        // Test partition_id with non-string literal - should NOT be supported
+        let int_filter = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::Eq,
+            right: Box::new(lit(42i64)),
+        });
+        assert!(!DataframeQueryTableProvider::is_supported_partition_id_filter(&int_filter));
+
+        // Test IN list with mixed types - should NOT be supported
+        let mixed_list = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            list: vec![lit("partition1"), lit(42i64)],
+            negated: false,
+        });
+        assert!(!DataframeQueryTableProvider::is_supported_partition_id_filter(&mixed_list));
+
+        // Test IN list with all strings - should be supported
+        let string_list = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            list: vec![lit("partition1"), lit("partition2")],
+            negated: false,
+        });
+        assert!(DataframeQueryTableProvider::is_supported_partition_id_filter(&string_list));
+    }
+
+    #[test]
+    fn test_conflicting_partition_equality_filters() {
+        use datafusion::logical_expr::lit;
+
+        // Test: partition_id == "A" AND partition_id == "B" (conflict!)
+        let filter1 = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::Eq,
+            right: Box::new(lit("A")),
+        });
+        let filter2 = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr {
+            left: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            op: Operator::Eq,
+            right: Box::new(lit("B")),
+        });
+
+        assert!(DataframeQueryTableProvider::has_conflicting_partition_equality_filters(&[&filter1, &filter2]));
+
+        // Test: partition_id == "A" AND partition_id == "A" (idempotent, no conflict)
+        assert!(!DataframeQueryTableProvider::has_conflicting_partition_equality_filters(&[&filter1, &filter1]));
+
+        // Test: partition_id == "A" (single filter, no conflict)
+        assert!(!DataframeQueryTableProvider::has_conflicting_partition_equality_filters(&[&filter1]));
+
+        // Test: partition_id IN ["A", "B"] (single IN expression, no conflict)
+        let in_filter = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new(
+                None::<String>,
+                ScanPartitionTableResponse::FIELD_PARTITION_ID,
+            ))),
+            list: vec![lit("A"), lit("B")],
+            negated: false,
+        });
+        assert!(!DataframeQueryTableProvider::has_conflicting_partition_equality_filters(&[&in_filter]));
+    }
 
     #[test]
     fn test_batches_grouping() {
