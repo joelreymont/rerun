@@ -166,8 +166,11 @@ impl PerformancePanel {
     const WINDOW_SIZE: usize = 60; // 60 frames = ~1 second at 60 FPS
 
     pub fn new() -> Self {
+        // Automatically enable panel when profiling/tracing is active
+        let enabled = cfg!(feature = "perf_telemetry");
+
         Self {
-            enabled: false,
+            enabled,
             paused: false,
             frame_times: VecDeque::with_capacity(Self::WINDOW_SIZE),
             frame_start: None,
