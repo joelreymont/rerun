@@ -26,16 +26,26 @@ rustflags = ['--cfg=web_sys_unstable_apis', '--cfg=getrandom_backend="wasm_js"']
 [target.x86_64-pc-windows-msvc]
 linker = "rust-lld"
 
-# Use mold linker on Linux for faster linking (if available)
-# Install with: cargo install -f mold
-# This can provide 2-5x faster linking compared to ld
-# NOTE: Falling back to lld since mold is not available
-[target.x86_64-unknown-linux-gnu]
+# macOS: Use lld for faster linking (1.5-2x faster than default ld64)
+# Requires LLVM/clang (install via: brew install llvm)
+[target.x86_64-apple-darwin]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
-# Fallback: use lld if mold is not available
-# Uncomment the following and comment out mold if needed:
-# [target.x86_64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Alternative for macOS: zld (macOS-specific, potentially 2-3x faster)
+# Install: brew install zld
+# Then uncomment and use full path:
+# [target.x86_64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/zld"]
+# [target.aarch64-apple-darwin]
+# rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/bin/zld"]
+
+# Linux: Use lld for faster linking (1.5-2x faster than default ld)
+# NOTE: mold is faster (2-5x) but not available in all environments
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
