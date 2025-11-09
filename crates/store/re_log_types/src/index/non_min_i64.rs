@@ -110,6 +110,44 @@ impl NonMinI64 {
         #[expect(clippy::unwrap_used)]
         Self::new(self.get().midpoint(rhs.get())).unwrap()
     }
+
+    /// For time timelines - create from nanoseconds.
+    ///
+    /// **Note:** This uses saturating conversion - `i64::MIN` is clamped to [`Self::MIN`].
+    /// This matches the behavior of [`crate::TimeInt::new_temporal`] to maintain consistency.
+    /// If you need to detect `i64::MIN`, use [`Self::new`] instead.
+    #[inline]
+    pub fn from_nanos(nanos: i64) -> Self {
+        Self::saturating_from_i64(nanos)
+    }
+
+    /// For time timelines - create from milliseconds.
+    ///
+    /// **Note:** This uses saturating conversion and saturating multiplication.
+    /// Overflow in the conversion from milliseconds to nanoseconds will clamp to [`Self::MIN`]
+    /// or [`Self::MAX`]. If you need to detect overflow, perform the conversion manually.
+    #[inline]
+    pub fn from_millis(millis: i64) -> Self {
+        Self::saturating_from_i64(millis.saturating_mul(1_000_000))
+    }
+
+    /// For time timelines - create from seconds.
+    ///
+    /// **Note:** This uses saturating conversion. Values are rounded to the nearest nanosecond.
+    /// Out-of-range float values are clamped to [`Self::MIN`] or [`Self::MAX`].
+    #[inline]
+    pub fn from_secs(seconds: f64) -> Self {
+        Self::saturating_from_i64((seconds * 1e9).round() as i64)
+    }
+
+    /// For sequence timelines - create from sequence number.
+    ///
+    /// **Note:** This uses saturating conversion - `i64::MIN` is clamped to [`Self::MIN`].
+    /// If you need to detect `i64::MIN`, use [`Self::new`] instead.
+    #[inline]
+    pub fn from_sequence(sequence: i64) -> Self {
+        Self::saturating_from_i64(sequence)
+    }
 }
 
 impl Default for NonMinI64 {
@@ -278,5 +316,33 @@ mod tests {
             let b = NonMinI64::new(b).unwrap();
             assert!(a < b);
         }
+    }
+
+    #[test]
+    fn test_helper_methods() {
+        // Test from_nanos
+        assert_eq!(NonMinI64::from_nanos(42), NonMinI64::new(42).unwrap());
+        assert_eq!(NonMinI64::from_nanos(i64::MIN), NonMinI64::MIN);
+
+        // Test from_millis
+        assert_eq!(
+            NonMinI64::from_millis(1),
+            NonMinI64::new(1_000_000).unwrap()
+        );
+        assert_eq!(
+            NonMinI64::from_millis(1000),
+            NonMinI64::new(1_000_000_000).unwrap()
+        );
+
+        // Test from_secs
+        assert_eq!(
+            NonMinI64::from_secs(1.0),
+            NonMinI64::new(1_000_000_000).unwrap()
+        );
+        assert_eq!(NonMinI64::from_secs(0.0), NonMinI64::ZERO);
+
+        // Test from_sequence
+        assert_eq!(NonMinI64::from_sequence(42), NonMinI64::new(42).unwrap());
+        assert_eq!(NonMinI64::from_sequence(0), NonMinI64::ZERO);
     }
 }

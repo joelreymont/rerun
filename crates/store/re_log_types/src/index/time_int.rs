@@ -191,24 +191,22 @@ impl From<NonMinI64> for TimeInt {
     }
 }
 
-impl From<TimeInt> for NonMinI64 {
-    fn from(value: TimeInt) -> Self {
-        match value.0 {
-            Some(value) => value,
-            None => Self::MIN,
+// Note: The previous lossy `From<TimeInt> for NonMinI64` implementation has been removed
+// in favor of the safer `TryFrom` below. The old implementation silently converted
+// TimeInt::STATIC to NonMinI64::MIN, which could hide bugs. Use `try_from()` or
+// `.try_into()` instead, which will return an error for STATIC values.
+
+impl TryFrom<TimeInt> for NonMinI64 {
+    type Error = TryFromIntError;
+
+    #[inline]
+    fn try_from(t: TimeInt) -> Result<Self, Self::Error> {
+        match t.0 {
+            Some(value) => Ok(value),
+            None => Err(TryFromIntError),
         }
     }
 }
-
-// TODO(#9534): refactor this mess
-// impl TryFrom<TimeInt> for NonMinI64 {
-//     type Error = TryFromIntError;
-
-//     #[inline]
-//     fn try_from(t: TimeInt) -> Result<Self, Self::Error> {
-//         Self::new(t.as_i64()).ok_or(TryFromIntError)
-//     }
-// }
 
 impl From<TimeInt> for Duration {
     #[inline]
@@ -287,6 +285,30 @@ mod tests {
         assert_eq!(
             TimeInt::saturated_temporal_i64(i64::MAX - 1),
             TimeInt::new_temporal(i64::MAX - 1)
+        );
+    }
+
+    #[test]
+    fn try_from_timeint_to_nonmin() {
+        // STATIC should fail conversion
+        assert!(NonMinI64::try_from(TimeInt::STATIC).is_err());
+
+        // Temporal values should succeed
+        assert_eq!(
+            NonMinI64::try_from(TimeInt::MIN).unwrap(),
+            NonMinI64::MIN
+        );
+        assert_eq!(
+            NonMinI64::try_from(TimeInt::MAX).unwrap(),
+            NonMinI64::MAX
+        );
+        assert_eq!(
+            NonMinI64::try_from(TimeInt::ZERO).unwrap(),
+            NonMinI64::ZERO
+        );
+        assert_eq!(
+            NonMinI64::try_from(TimeInt::new_temporal(42)).unwrap(),
+            NonMinI64::new(42).unwrap()
         );
     }
 }

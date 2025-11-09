@@ -223,11 +223,13 @@ impl ViewerOpenUrl {
             fragment.selection = selection.first_item().and_then(|item| item.to_data_path());
             fragment.when = time_ctrl.and_then(|time_ctrl| {
                 let time = time_ctrl.time_int()?;
+                // TimeCell requires NonMinI64 (temporal values only, not STATIC)
+                let value = time.try_into().ok()?;
                 Some((
                     *time_ctrl.timeline().name(),
                     re_log_types::TimeCell {
                         typ: time_ctrl.time_type(),
-                        value: time.into(),
+                        value,
                     },
                 ))
             });

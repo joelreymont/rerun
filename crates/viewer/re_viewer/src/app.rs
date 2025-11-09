@@ -684,11 +684,13 @@ impl App {
                     // We don't want to update the url while playing, so we use the last paused time.
                     if let Some(fragment) = url.fragment_mut() {
                         fragment.when = time_ctrl.and_then(|time_ctrl| {
+                            // TimeCell requires NonMinI64 (temporal values only, not STATIC)
+                            let value = time_ctrl.last_paused_time()?.floor().try_into().ok()?;
                             Some((
                                 *time_ctrl.timeline().name(),
                                 re_log_types::TimeCell {
                                     typ: time_ctrl.time_type(),
-                                    value: time_ctrl.last_paused_time()?.floor().into(),
+                                    value,
                                 },
                             ))
                         });
