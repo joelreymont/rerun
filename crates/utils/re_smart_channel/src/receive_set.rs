@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossbeam::channel::Select;
 use parking_lot::Mutex;
 
-use crate::{Receiver, RecvError, SmartChannelSource, SmartMessage};
+use crate::{Receiver, RecvError, SizeBytes, SmartChannelSource, SmartMessage};
 
 /// A set of connected [`Receiver`]s.
 ///
@@ -116,6 +116,16 @@ impl<T: Send> ReceiveSet<T> {
         rx.iter().map(|r| r.len()).sum()
     }
 
+    /// Sum queue bytes of all receivers.
+    ///
+    /// This is only accurate for types that implement [`crate::SizeBytes`].
+    /// For other types, this will return 0.
+    pub fn queue_bytes(&self) -> u64 {
+        re_tracing::profile_function!();
+        let rx = self.receivers.lock();
+        rx.iter().map(|r| r.queue_bytes()).sum()
+    }
+
     /// Blocks until a message is ready to be received,
     /// or we are empty.
     pub fn recv(&self) -> Result<SmartMessage<T>, RecvError> {
@@ -140,7 +150,10 @@ impl<T: Send> ReceiveSet<T> {
     }
 
     /// Returns immediately if there is nothing to receive.
-    pub fn try_recv(&self) -> Option<(Arc<SmartChannelSource>, SmartMessage<T>)> {
+    pub fn try_recv(&self) -> Option<(Arc<SmartChannelSource>, SmartMessage<T>)>
+    where
+        T: crate::SizeBytes,
+    {
         re_tracing::profile_function!();
 
         let mut rx = self.receivers.lock();
@@ -158,13 +171,21 @@ impl<T: Send> ReceiveSet<T> {
         let oper = sel.try_select().ok()?;
         let index = oper.index();
         if let Ok(msg) = oper.recv(&rx[index].rx) {
+            // Track bytes for the received message
+            let size = msg.total_size_bytes();
+            rx[index].stats.queue_bytes.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+
+            // Update latency
+            let latency_nanos = msg.time.elapsed().as_nanos() as u64;
+            rx[index].stats.latency_nanos.store(latency_nanos, std::sync::atomic::Ordering::Relaxed);
+
             return Some((rx[index].source.clone(), msg));
         }
 
         // Nothing ready to receive, but we must poll all receivers to update their `connected` status.
         // Why use `select` first? Because `select` is fair (random) when there is contention.
         for rx in rx.iter() {
-            if let Ok(msg) = rx.try_recv() {
+            if let Ok(msg) = rx.try_recv_tracking() {
                 return Some((rx.source.clone(), msg));
             }
         }

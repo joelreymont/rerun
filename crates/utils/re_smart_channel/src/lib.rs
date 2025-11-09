@@ -6,6 +6,7 @@ use re_uri::RedapUri;
 use web_time::Instant;
 
 pub use crossbeam::channel::{RecvError, RecvTimeoutError, SendError, TryRecvError};
+pub use re_byte_size::SizeBytes;
 
 mod receive_set;
 mod receiver;
@@ -273,6 +274,9 @@ impl std::fmt::Display for SmartMessageSource {
 pub(crate) struct SharedStats {
     /// Latest known latency from sending a message to receiving it, it nanoseconds.
     latency_nanos: AtomicU64,
+
+    /// Total bytes currently queued in the channel.
+    queue_bytes: AtomicU64,
 }
 
 pub fn smart_channel<T: Send>(
@@ -357,6 +361,39 @@ impl<T: Send> SmartMessage<T> {
             SmartMessagePayload::Msg(msg) => Some(msg),
             SmartMessagePayload::Flush { .. } | SmartMessagePayload::Quit(_) => None,
         }
+    }
+
+    /// Estimate size in bytes for tracking purposes.
+    ///
+    /// For types implementing SizeBytes, this returns accurate total size.
+    /// For other types, returns stack size as approximation.
+    pub fn estimated_total_bytes(&self) -> u64
+    where
+        T: SizeBytes,
+    {
+        self.total_size_bytes()
+    }
+
+    /// Fallback size estimation for types without SizeBytes.
+    /// Returns only the stack-allocated size.
+    pub fn stack_size_estimation(&self) -> u64 {
+        std::mem::size_of_val(self) as u64
+    }
+}
+
+impl<T: Send + SizeBytes> SizeBytes for SmartMessagePayload<T> {
+    fn heap_size_bytes(&self) -> u64 {
+        match self {
+            Self::Msg(msg) => msg.heap_size_bytes(),
+            Self::Flush { .. } => 0,
+            Self::Quit(_) => 0,
+        }
+    }
+}
+
+impl<T: Send + SizeBytes> SizeBytes for SmartMessage<T> {
+    fn heap_size_bytes(&self) -> u64 {
+        self.payload.heap_size_bytes()
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::{Arc, atomic::Ordering::Relaxed};
 
 use web_time::Instant;
 
-use crate::{SendError, SharedStats, SmartMessage, SmartMessagePayload, SmartMessageSource};
+use crate::{SendError, SharedStats, SizeBytes, SmartMessage, SmartMessagePayload, SmartMessageSource};
 
 #[derive(Clone)]
 pub struct Sender<T: Send> {
@@ -29,13 +29,25 @@ impl<T: Send> Sender<T> {
         }
     }
 
-    pub fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        self.send_at(
-            Instant::now(),
-            Arc::clone(&self.source),
-            SmartMessagePayload::Msg(msg),
+    pub fn send(&self, msg: T) -> Result<(), SendError<T>>
+    where
+        T: crate::SizeBytes,
+    {
+        let smart_msg = SmartMessage {
+            time: Instant::now(),
+            source: Arc::clone(&self.source),
+            payload: SmartMessagePayload::Msg(msg),
+        };
+
+        let size = smart_msg.total_size_bytes();
+
+        self.send_at_with_size(
+            smart_msg.time,
+            smart_msg.source,
+            smart_msg.payload,
+            size,
         )
-        .map_err(|SendError(msg)| match msg {
+        .map_err(|SendError(payload)| match payload {
             SmartMessagePayload::Msg(msg) => SendError(msg),
             SmartMessagePayload::Flush { .. } | SmartMessagePayload::Quit(_) => unreachable!(),
         })
@@ -58,6 +70,37 @@ impl<T: Send> Sender<T> {
                 payload,
             })
             .map_err(|SendError(msg)| SendError(msg.payload))
+    }
+
+    /// Forwards a message as-is, tracking the given size in bytes.
+    ///
+    /// This is used internally when the size is known. For types that implement
+    /// [`SizeBytes`], use [`Self::send`] which automatically calculates the size.
+    pub fn send_at_with_size(
+        &self,
+        time: Instant,
+        source: Arc<SmartMessageSource>,
+        payload: SmartMessagePayload<T>,
+        size_bytes: u64,
+    ) -> Result<(), SendError<SmartMessagePayload<T>>> {
+        // NOTE: We should never be sending a message with an unknown source.
+        debug_assert!(!matches!(*source, SmartMessageSource::Unknown));
+
+        // Track the size before sending
+        self.stats.queue_bytes.fetch_add(size_bytes, Relaxed);
+
+        match self.tx.send(SmartMessage {
+            time,
+            source,
+            payload,
+        }) {
+            Ok(()) => Ok(()),
+            Err(SendError(msg)) => {
+                // If send failed, undo the size tracking
+                self.stats.queue_bytes.fetch_sub(size_bytes, Relaxed);
+                Err(SendError(msg.payload))
+            }
+        }
     }
 
     /// Blocks until all previously sent messages have been received.
@@ -129,5 +172,61 @@ impl<T: Send> Sender<T> {
     /// in seconds
     pub fn latency_sec(&self) -> f32 {
         self.latency_nanos() as f32 / 1e9
+    }
+
+    /// Total bytes currently queued in the channel.
+    ///
+    /// This is only accurate for types that implement [`SizeBytes`].
+    /// For other types, this will return 0.
+    pub fn queue_bytes(&self) -> u64 {
+        self.stats.queue_bytes.load(Relaxed)
+    }
+}
+
+// Additional implementations for types that support size tracking
+impl<T: Send + SizeBytes> Sender<T> {
+    /// Send a message, automatically tracking its size.
+    pub fn send_tracking(&self, msg: T) -> Result<(), SendError<T>> {
+        let smart_msg = SmartMessage {
+            time: Instant::now(),
+            source: Arc::clone(&self.source),
+            payload: SmartMessagePayload::Msg(msg),
+        };
+
+        let size = smart_msg.total_size_bytes();
+
+        self.send_at_with_size(
+            smart_msg.time,
+            smart_msg.source,
+            smart_msg.payload,
+            size,
+        )
+        .map_err(|SendError(payload)| match payload {
+            SmartMessagePayload::Msg(msg) => SendError(msg),
+            SmartMessagePayload::Flush { .. } | SmartMessagePayload::Quit(_) => unreachable!(),
+        })
+    }
+
+    /// Forwards a message as-is, automatically calculating and tracking its size.
+    pub fn send_at_tracking(
+        &self,
+        time: Instant,
+        source: Arc<SmartMessageSource>,
+        payload: SmartMessagePayload<T>,
+    ) -> Result<(), SendError<SmartMessagePayload<T>>> {
+        let smart_msg = SmartMessage {
+            time,
+            source,
+            payload,
+        };
+
+        let size = smart_msg.total_size_bytes();
+
+        self.send_at_with_size(
+            smart_msg.time,
+            smart_msg.source,
+            smart_msg.payload,
+            size,
+        )
     }
 }

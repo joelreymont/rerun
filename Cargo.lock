@@ -9579,6 +9579,7 @@ version = "0.27.0-alpha.8+dev"
 dependencies = [
  "crossbeam",
  "parking_lot",
+ "re_byte_size",
  "re_tracing",
  "re_uri",
  "serde",

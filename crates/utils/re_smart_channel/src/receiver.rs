@@ -3,11 +3,11 @@ use std::sync::{
     atomic::{AtomicBool, Ordering::Relaxed},
 };
 
-use crate::{SharedStats, SmartChannelSource, SmartMessage, TryRecvError};
+use crate::{SharedStats, SizeBytes, SmartChannelSource, SmartMessage, TryRecvError};
 
 pub struct Receiver<T: Send> {
     pub(crate) rx: crossbeam::channel::Receiver<SmartMessage<T>>,
-    stats: Arc<SharedStats>,
+    pub(crate) stats: Arc<SharedStats>,
     pub(crate) source: Arc<SmartChannelSource>,
     connected: AtomicBool,
 }
@@ -124,6 +124,14 @@ impl<T: Send> Receiver<T> {
         self.latency_nanos() as f32 / 1e9
     }
 
+    /// Total bytes currently queued in the channel.
+    ///
+    /// This is only accurate for types that implement [`SizeBytes`].
+    /// For other types, this will return 0.
+    pub fn queue_bytes(&self) -> u64 {
+        self.stats.queue_bytes.load(Relaxed)
+    }
+
     /// Create a new channel that use the same stats as this one.
     ///
     /// This means both channels will see the same latency numbers.
@@ -138,5 +146,74 @@ impl<T: Send> Receiver<T> {
             self.source.clone(),
             self.stats.clone(),
         )
+    }
+}
+
+// Additional implementations for types that support size tracking
+impl<T: Send + SizeBytes> Receiver<T> {
+    /// Receive a message, automatically calculating and tracking its size.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn recv_tracking(&self) -> Result<SmartMessage<T>, crate::RecvError> {
+        let Ok(msg) = self.rx.recv() else {
+            self.connected.store(false, Relaxed);
+            return Err(crate::RecvError);
+        };
+
+        let latency_nanos = msg.time.elapsed().as_nanos() as u64;
+        self.stats.latency_nanos.store(latency_nanos, Relaxed);
+
+        // Decrement queue bytes
+        let size = msg.total_size_bytes();
+        self.stats.queue_bytes.fetch_sub(size, Relaxed);
+
+        Ok(msg)
+    }
+
+    /// Try to receive a message, automatically calculating and tracking its size.
+    pub fn try_recv_tracking(&self) -> Result<SmartMessage<T>, TryRecvError> {
+        let msg = match self.rx.try_recv() {
+            Ok(x) => x,
+            Err(err) => {
+                if err == TryRecvError::Disconnected {
+                    self.connected.store(false, Relaxed);
+                }
+                return Err(err);
+            }
+        };
+
+        let latency_nanos = msg.time.elapsed().as_nanos() as u64;
+        self.stats.latency_nanos.store(latency_nanos, Relaxed);
+
+        // Decrement queue bytes
+        let size = msg.total_size_bytes();
+        self.stats.queue_bytes.fetch_sub(size, Relaxed);
+
+        Ok(msg)
+    }
+
+    /// Receive a message with timeout, automatically calculating and tracking its size.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn recv_timeout_tracking(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<SmartMessage<T>, crate::RecvTimeoutError> {
+        let msg = match self.rx.recv_timeout(timeout) {
+            Ok(x) => x,
+            Err(err) => {
+                if err == crate::RecvTimeoutError::Disconnected {
+                    self.connected.store(false, Relaxed);
+                }
+                return Err(err);
+            }
+        };
+
+        let latency_nanos = msg.time.elapsed().as_nanos() as u64;
+        self.stats.latency_nanos.store(latency_nanos, Relaxed);
+
+        // Decrement queue bytes
+        let size = msg.total_size_bytes();
+        self.stats.queue_bytes.fetch_sub(size, Relaxed);
+
+        Ok(msg)
     }
 }

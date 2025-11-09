@@ -2,7 +2,7 @@
 
 pub mod shutdown;
 
-use std::{collections::VecDeque, net::SocketAddr, pin::Pin};
+use std::{collections::VecDeque, net::SocketAddr, pin::Pin, sync::Arc};
 
 use tokio::{
     net::TcpListener,
@@ -48,6 +48,164 @@ pub const MAX_ENCODING_MESSAGE_SIZE: usize = MAX_DECODING_MESSAGE_SIZE;
 const MESSAGE_QUEUE_CAPACITY: usize =
     (16 * 1024 * 1024 / std::mem::size_of::<LogOrTableMsgProto>()).next_power_of_two();
 
+/// Helper to monitor queue size and apply backpressure.
+#[derive(Clone)]
+struct BackpressureMonitor {
+    policy: BackpressurePolicy,
+    output_channel: Option<Arc<re_smart_channel::Sender<re_log_types::DataSourceMessage>>>,
+}
+
+impl BackpressureMonitor {
+    fn new(policy: BackpressurePolicy) -> Self {
+        Self {
+            policy,
+            output_channel: None,
+        }
+    }
+
+    fn with_channel(mut self, sender: Arc<re_smart_channel::Sender<re_log_types::DataSourceMessage>>) -> Self {
+        self.output_channel = Some(sender);
+        self
+    }
+
+    fn current_queue_bytes(&self) -> u64 {
+        self.output_channel
+            .as_ref()
+            .map(|ch| ch.queue_bytes())
+            .unwrap_or(0)
+    }
+
+    async fn wait_for_capacity(&self) -> Result<(), tonic::Status> {
+        if !self.policy.enabled {
+            return Ok(());
+        }
+
+        let start = std::time::Instant::now();
+        let max_wait = std::time::Duration::from_millis(self.policy.max_backpressure_wait_ms);
+        let delay = std::time::Duration::from_millis(self.policy.backpressure_delay_ms);
+
+        loop {
+            let queue_bytes = self.current_queue_bytes();
+
+            if queue_bytes < self.policy.max_queue_bytes {
+                return Ok(());
+            }
+
+            if start.elapsed() > max_wait {
+                re_log::error!(
+                    "Backpressure timeout after {:?}: queue at {} MiB (limit {} MiB)",
+                    max_wait,
+                    queue_bytes / 1024 / 1024,
+                    self.policy.max_queue_bytes / 1024 / 1024
+                );
+                return Err(tonic::Status::resource_exhausted(
+                    "Viewer cannot keep up with data rate - queue full"
+                ));
+            }
+
+            // Log backpressure (rate-limited)
+            static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let last_warn = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+            if now_secs.saturating_sub(last_warn) >= 2 {
+                re_log::warn!(
+                    "Backpressure active: queue at {} MiB (limit {} MiB)",
+                    queue_bytes / 1024 / 1024,
+                    self.policy.max_queue_bytes / 1024 / 1024
+                );
+                LAST_WARN.store(now_secs, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+
+/// Policy for applying backpressure when output queues become too large.
+///
+/// Backpressure prevents unbounded memory growth by throttling producers when
+/// consumers cannot keep up with the data rate.
+#[derive(Clone, Copy, Debug)]
+pub struct BackpressurePolicy {
+    /// Maximum bytes allowed in output smart channel queue before applying backpressure.
+    ///
+    /// When the queue exceeds this limit, the gRPC server will slow down message
+    /// acceptance to allow the viewer to catch up.
+    ///
+    /// Set to `u64::MAX` to effectively disable backpressure.
+    pub max_queue_bytes: u64,
+
+    /// How long to sleep between backpressure checks when queue is full.
+    pub backpressure_delay_ms: u64,
+
+    /// Maximum time to wait for queue to drain before returning an error.
+    ///
+    /// This prevents deadlock if the viewer stops processing messages entirely.
+    pub max_backpressure_wait_ms: u64,
+
+    /// Whether backpressure is enabled.
+    ///
+    /// When false, backpressure checks are skipped entirely (for backwards compatibility).
+    pub enabled: bool,
+}
+
+impl Default for BackpressurePolicy {
+    fn default() -> Self {
+        Self::platform_default()
+    }
+}
+
+impl BackpressurePolicy {
+    /// Platform-specific defaults.
+    ///
+    /// Web has more constrained memory, so uses lower limits.
+    pub fn platform_default() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let max_queue_bytes = 50 * 1024 * 1024; // 50 MiB for web
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let max_queue_bytes = 200 * 1024 * 1024; // 200 MiB for desktop
+
+        Self {
+            max_queue_bytes,
+            backpressure_delay_ms: 10,
+            max_backpressure_wait_ms: 5000, // 5 seconds
+            enabled: true,
+        }
+    }
+
+    /// Disable backpressure entirely.
+    pub fn disabled() -> Self {
+        Self {
+            max_queue_bytes: u64::MAX,
+            backpressure_delay_ms: 0,
+            max_backpressure_wait_ms: 0,
+            enabled: false,
+        }
+    }
+
+    /// Check environment variables for overrides.
+    pub fn from_env(mut self) -> Self {
+        if let Ok(val) = std::env::var("RERUN_MAX_QUEUE_BYTES") {
+            if let Ok(bytes) = val.parse::<u64>() {
+                re_log::info!("Overriding max_queue_bytes from env: {} bytes", bytes);
+                self.max_queue_bytes = bytes;
+            }
+        }
+
+        if std::env::var("RERUN_DISABLE_BACKPRESSURE").is_ok() {
+            re_log::info!("Disabling backpressure from env");
+            self.enabled = false;
+            self.max_queue_bytes = u64::MAX;
+        }
+
+        self
+    }
+}
+
 /// Options for the gRPC Proxy Server
 #[derive(Clone, Copy, Debug)]
 pub struct ServerOptions {
@@ -60,6 +218,9 @@ pub struct ServerOptions {
     /// any data is sent, it is highly recommended that you set the memory limit to `0B`,
     /// otherwise you're potentially doubling your memory usage!
     pub memory_limit: MemoryLimit,
+
+    /// Backpressure policy for controlling data ingestion rate.
+    pub backpressure_policy: BackpressurePolicy,
 }
 
 impl Default for ServerOptions {
@@ -67,6 +228,7 @@ impl Default for ServerOptions {
         Self {
             playback_behavior: PlaybackBehavior::OldestFirst,
             memory_limit: MemoryLimit::UNLIMITED,
+            backpressure_policy: BackpressurePolicy::default(),
         }
     }
 }
@@ -813,6 +975,7 @@ pub struct MessageProxy {
     options: ServerOptions,
     _queue_task_handle: tokio::task::JoinHandle<()>,
     event_tx: mpsc::Sender<Event>,
+    backpressure_monitor: BackpressureMonitor,
 }
 
 impl MessageProxy {
@@ -831,6 +994,8 @@ impl MessageProxy {
         let (broadcast_log_tx, broadcast_log_rx) = broadcast::channel(MESSAGE_QUEUE_CAPACITY);
         let (broadcast_table_tx, broadcast_table_rx) = broadcast::channel(MESSAGE_QUEUE_CAPACITY);
 
+        let backpressure_monitor = BackpressureMonitor::new(options.backpressure_policy);
+
         let task_handle = tokio::spawn(async move {
             EventLoop::new(options, event_rx, broadcast_log_tx, broadcast_table_tx)
                 .run_in_place()
@@ -842,18 +1007,33 @@ impl MessageProxy {
                 options,
                 _queue_task_handle: task_handle,
                 event_tx,
+                backpressure_monitor,
             },
             broadcast_log_rx,
             broadcast_table_rx,
         )
     }
 
-    async fn push_msg(&self, msg: LogMsgProto) {
-        self.event_tx.send(Event::Message(msg)).await.ok();
+    async fn push_msg(&self, msg: LogMsgProto) -> Result<(), tonic::Status> {
+        // Apply backpressure if queue is too full
+        self.backpressure_monitor.wait_for_capacity().await?;
+
+        self.event_tx
+            .send(Event::Message(msg))
+            .await
+            .map_err(|_| tonic::Status::internal("Event queue closed"))?;
+        Ok(())
     }
 
-    async fn push_table(&self, table: TableMsgProto) {
-        self.event_tx.send(Event::Table(table)).await.ok();
+    async fn push_table(&self, table: TableMsgProto) -> Result<(), tonic::Status> {
+        // Apply backpressure if queue is too full
+        self.backpressure_monitor.wait_for_capacity().await?;
+
+        self.event_tx
+            .send(Event::Table(table))
+            .await
+            .map_err(|_| tonic::Status::internal("Event queue closed"))?;
+        Ok(())
     }
 
     async fn new_client_message_stream(&self) -> ReadMessagesStream {
@@ -961,7 +1141,8 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
                 Ok(Some(WriteMessagesRequest {
                     log_msg: Some(log_msg),
                 })) => {
-                    self.push_msg(log_msg).await;
+                    // Backpressure is applied here
+                    self.push_msg(log_msg).await?;
                 }
 
                 Ok(Some(WriteMessagesRequest { log_msg: None })) => {
@@ -1003,7 +1184,8 @@ impl message_proxy_service_server::MessageProxyService for MessageProxy {
             data: Some(data),
         } = request.into_inner()
         {
-            self.push_table(TableMsgProto { id, data }).await;
+            // Backpressure is applied here
+            self.push_table(TableMsgProto { id, data }).await?;
         } else {
             re_log::warn!("malformed `WriteTableRequest`");
         }

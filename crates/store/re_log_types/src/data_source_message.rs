@@ -1,6 +1,8 @@
 // TODO(andreas): Conceptually these should go to `re_data_source`.
 // However, `re_data_source` depends on everything that _implements_ a datasource, therefore we would get a circular dependency!
 
+use re_byte_size::SizeBytes;
+
 use crate::{AbsoluteTimeRange, LogMsg, StoreId, TimelineName, impl_into_enum};
 
 /// Message from a data source.
@@ -47,4 +49,32 @@ pub enum DataSourceUiCommand {
         // Not using `re_uri::Fragment` to avoid further dependency entanglement.
         fragment: String, //re_uri::Fragment,
     },
+}
+
+impl SizeBytes for DataSourceMessage {
+    fn heap_size_bytes(&self) -> u64 {
+        match self {
+            Self::LogMsg(msg) => msg.heap_size_bytes(),
+            Self::UiCommand(cmd) => cmd.heap_size_bytes(),
+        }
+    }
+}
+
+impl SizeBytes for DataSourceUiCommand {
+    fn heap_size_bytes(&self) -> u64 {
+        match self {
+            Self::AddValidTimeRange {
+                store_id,
+                timeline,
+                time_range: _,
+            } => {
+                store_id.heap_size_bytes()
+                    + timeline.as_ref().map_or(0, |t| t.heap_size_bytes())
+            }
+            Self::SetUrlFragment {
+                store_id,
+                fragment,
+            } => store_id.heap_size_bytes() + fragment.capacity() as u64,
+        }
+    }
 }
