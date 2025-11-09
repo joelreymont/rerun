@@ -1,0 +1,212 @@
+================================================================================
+                RERUN QUERY & CACHING SYSTEM - EXECUTIVE SUMMARY
+================================================================================
+
+Location: /home/user/rerun/crates/store/re_query/ (2,500 lines of code)
+
+KEY FINDINGS
+================================================================================
+
+1. HOW QUERYCACHE WORKS
+   - Lazy loading: Data cached only on first access, not proactively
+   - Coordinator pattern: Central QueryCache manages LatestAtCache + RangeCache
+   - Arc-based locking: Top-level lock released immediately, per-cache locks held
+   - Fine-grained keys: Separate caches for each (entity, timeline, component) tuple
+
+2. CACHING STRATEGIES
+
+   A. LatestAtCache (Most Common)
+      - Indexed by query time in BTreeMap (O(log n) hits)
+      - Stores both positive (data found) and negative (no data) results
+      - Reference deduplication: Multiple query times pointing to same data
+      - Static data bypass: Doesn't cache per-query-time for static data
+      
+   B. RangeCache
+      - Indexed by chunk ID in HashMap (O(1) access)
+      - Pre-processes chunks on cache: densify + timeline sort
+      - Tracks memory cost via "resorted" flag
+      - Always rescans store indices (index scan not cached)
+      
+   C. Clearing Optimization (might_require_clearing)
+      - Tracks entities ever having Clear components
+      - Skips expensive clear hierarchy checks for most entities
+      - "Huge performance improvement in practice" per code comments
+
+3. LATEST-AT QUERY OPTIMIZATION
+
+   Three-step pipeline:
+   
+   Step 1: Pre-filtering (most important)
+           - Filter components that actually exist on timeline
+           - Avoids expensive store queries for non-existent data
+           - Comment: "This pre-filtering is extremely important"
+   
+   Step 2: Clear checking
+           - Walks entity hierarchy checking for Clear components
+           - Uses might_require_clearing to skip most entities
+           - Compound index ensures temporal consistency
+   
+   Step 3: Independent component queries
+           - Each component has its own cache entry
+           - Deferred invalidation batches updates
+           - Frame rendering naturally micro-batches work
+
+4. COST OF CACHE MISSES
+
+   LatestAtCache Miss Cost:
+   - Lock acquisition + HashMap lookup
+   - ChunkStore::latest_at_relevant_chunks() → full index scan
+   - Filter results, find max by (TimeInt, RowId)
+   - Optional cache insertion
+   → HIGH cost (requires store query)
+   
+   RangeCache Miss Cost:
+   - Store range query
+   - For each chunk: Optional densify + sort (O(n log n) per chunk!)
+   → VERY HIGH cost (includes chunk reorganization)
+   
+   Cache Miss Avoidance:
+   - Pre-filtering: Prevents cache misses for non-existent data
+   - Negative caching: Prevents re-running queries with no results
+   - Deferred invalidation: Batches work, reduces contention
+   - might_require_clearing: Skips expensive operations for most entities
+
+5. QUERY PERFORMANCE BENCHMARKS & PROFILING
+
+   Benchmark Setup (benches/latest_at.rs):
+   - Mono points: 1,000 entities × 1,000 frames = 1M data points
+   - Batch points: 1 entity × 1,000 frames × 1,000 points = 1M data points
+   - String labels: Variable-length string benchmarks
+   
+   Benchmark Operations:
+   - Insert performance: Measures chunk storage + cache population
+   - Query performance: Measures cache hits/misses at frame rate
+   - Uses clamped_zip for safe component batching
+   
+   Expected Performance:
+   - First query for (entity, timeline, component): Cache miss (expensive)
+   - Repeated queries at same time: Cache hit - O(log n) BTreeMap lookup
+   - Different times → same data: Reference deduplication saves memory
+   - Mono data overhead: More cache entries but simpler zip logic
+   
+   Profiling Points:
+   - cache.handle_pending_invalidation() - Deferred, batched
+   - cache.latest_at() - Per-query (no scope to reduce overhead)
+   - cache.on_events() - Event processing ("compact events", "static", "temporal")
+
+ARCHITECTURAL INSIGHTS
+================================================================================
+
+Memory Efficiency:
+- Reference deduplication: Static data accessed at 1M times = 1 cache entry
+- Pre-processing: Chunk sorting/densifying done once, not per-query
+- SizeBytes tracking: Distinguishes effective size (if copied) vs actual size
+
+Invalidation Strategy:
+- Deferred: Invalidations applied at query time, not immediately
+- Batched: Frame rendering naturally batches many invalidations
+- Comment: "the frame time effectively behaves as a natural micro-batching"
+- Risk: Pending invalidations could grow unbounded (TODO #5974)
+
+Optimization for Frame Rendering:
+- Same queries repeat frame-to-frame → cache hits dominate
+- Temporal locality: Queries cluster around frame times
+- Most entities have no Clear data → might_require_clearing helps
+- Memory matters but speed matters more
+
+KNOWN LIMITATIONS & TODOs
+================================================================================
+
+TODO #7008 (range.rs:270): Unnecessary sorting on unhappy path
+    - Range cache sorts chunks even when already sorted
+    - Medium priority optimization opportunity
+
+TODO #5974 (latest_at.rs:686): Pending invalidations unbounded growth
+    - If data never inserted, pending_invalidations kept indefinitely
+    - Low priority (rare case, no dedicated GC yet)
+
+TODO #403 (cache.rs:403): Static event handling "horribly stupid and slow"
+    - Acknowledged as slow but "pretty much never happens in practice"
+    - Low priority, requires metrics before optimization
+
+TODO (latest_at.rs:24): DataIndex abstraction needed
+    - Could improve index comparison operations
+    - Low priority refactoring
+
+PERFORMANCE CHARACTERISTICS SUMMARY
+================================================================================
+
+Strengths:
+✓ Lazy caching prevents wasted computation
+✓ Deferred invalidation reduces contention
+✓ Reference deduplication saves memory
+✓ might_require_clearing eliminates unnecessary Clear checks (huge win)
+✓ Pre-filtering avoids expensive store queries
+✓ Negative caching prevents re-running failed queries
+
+Weaknesses:
+✗ Range queries require chunk pre-processing (expensive miss cost)
+✗ TODO #7008: Unnecessary sorting on unhappy path
+✗ TODO #5974: Cache invalidation tracking unbounded
+✗ TODO #403: Static cache population acknowledged as very slow
+
+Time Complexity:
+- Cache Hit (latest-at): O(log n) BTreeMap lookup
+- Cache Hit (range): O(1) HashMap lookup
+- Cache Miss (latest-at): O(m) - scan m relevant chunks
+- Cache Miss (range): O(m) + O(m log m) - scan + sort chunks
+- Clear check: O(d * log n) where d = entity depth
+
+Core Design Principle:
+"The system is optimized for the common case (repeated queries at the same 
+times with clearing), where most operations hit cache and are O(1) to O(log n). 
+Cache misses are expensive but rare in practice due to frame-based temporal 
+locality."
+
+DOCUMENTATION FILES
+================================================================================
+
+Three detailed analysis documents have been created:
+
+1. QUERY_CACHE_ANALYSIS.md (14 KB)
+   - Comprehensive overview of all 5 requested topics
+   - Architecture principles, design patterns
+   - Memory vs speed tradeoffs
+
+2. QUERY_CACHE_CODE_REFERENCE.md (22 KB)
+   - Detailed code sections with absolute file paths
+   - All critical implementations with line numbers
+   - Performance characteristics table
+
+3. QUERY_CACHE_QUICK_REFERENCE.md (11 KB)
+   - Quick reference guide for developers
+   - Cache hit vs miss performance paths
+   - Performance optimization checklist
+   - Debugging tips and integration points
+
+Files located in: /home/user/rerun/
+
+KEY FILES IN CODEBASE
+================================================================================
+
+Primary Implementation:
+- cache.rs (454 lines) - QueryCache coordinator, invalidation handling
+  * Lines 142-262: QueryCache structure & initialization
+  * Lines 281-452: Event handling & deferred invalidation
+
+- latest_at.rs (704 lines) - LatestAt cache & queries
+  * Lines 40-166: Main query API with optimization steps
+  * Lines 515-703: LatestAtCache implementation
+  * Lines 617-669: Cache hit/miss logic
+
+- range.rs (317 lines) - Range cache implementation
+  * Lines 125-316: RangeCache with pre-processing
+
+- cache_stats.rs (109 lines) - Statistics & metrics
+
+Benchmarks:
+- benches/latest_at.rs (328 lines) - Performance benchmarks
+  * 4 test scenarios: mono points, batch points, mono strings, batch strings
+  * Query patterns: iterate entities → query latest-at → extract components
+
+================================================================================
