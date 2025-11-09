@@ -21,6 +21,7 @@ mod saving;
 mod screenshotter;
 mod startup_options;
 mod ui;
+mod visualizable_entities_cache;
 
 #[cfg(feature = "analytics")]
 mod viewer_analytics;
