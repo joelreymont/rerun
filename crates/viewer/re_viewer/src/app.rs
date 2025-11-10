@@ -2497,7 +2497,42 @@ impl App {
         });
 
         #[cfg(not(target_arch = "wasm32"))]
-        self.process_ingestion_worker_output(store_hub, egui_ctx);
+        {
+            // Process background ingestion workers for all stores
+            let all_results = store_hub.on_frame_start();
+
+            for (_store_id, results) in all_results {
+                for (processed, was_empty_before, entity_db_add_result) in results {
+                    self.finalize_arrow_chunk_ingestion(
+                        store_hub,
+                        egui_ctx,
+                        processed.channel_source.as_ref(),
+                        &processed.store_id,
+                        processed.msg_will_add_new_store,
+                        was_empty_before,
+                        entity_db_add_result,
+                    );
+                }
+            }
+
+            // Check if all messages have been ingested after processing worker output
+            if self.rrd_loading_metrics.is_tracking {
+                let all_ingested = self.rrd_loading_metrics.total_messages > 0
+                    && self.rrd_loading_metrics.total_messages
+                        == self.rrd_loading_metrics.total_ingested;
+
+                if all_ingested
+                    && self.rrd_loading_metrics.all_messages_ingested.is_none()
+                    && self.rx_log.sources().is_empty()
+                {
+                    re_log::info!(
+                        "🎉 All {} messages have been ingested!",
+                        self.rrd_loading_metrics.total_messages
+                    );
+                    self.rrd_loading_metrics.mark_all_ingested();
+                }
+            }
+        }
 
         let start = web_time::Instant::now();
 
@@ -2762,99 +2797,6 @@ impl App {
         // Handle any action that is triggered by a new store _after_ processing the message that caused it.
         if msg_will_add_new_store {
             self.on_new_store(egui_ctx, store_id, channel_source, store_hub);
-        }
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn process_ingestion_worker_output(
-        &mut self,
-        store_hub: &mut StoreHub,
-        egui_ctx: &egui::Context,
-    ) {
-        re_tracing::profile_function!();
-
-        // Debug: Log every time this function is called
-        static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 100 == 0 || self.rrd_loading_metrics.total_messages > 100000 {
-            re_log::debug!(
-                "[process_ingestion_worker_output] Called #{}, is_tracking={}, all_ingested={:?}, total_msg={}, total_ingested={}",
-                count,
-                self.rrd_loading_metrics.is_tracking,
-                self.rrd_loading_metrics.all_messages_ingested.is_some(),
-                self.rrd_loading_metrics.total_messages,
-                self.rrd_loading_metrics.total_ingested
-            );
-        }
-
-        // Collect store IDs first to avoid borrowing issues
-        let store_ids: Vec<StoreId> = store_hub
-            .store_bundle()
-            .entity_dbs()
-            .map(|entity_db| entity_db.store_id().clone())
-            .collect();
-
-        // Poll each EntityDb's worker for processed chunks
-        for store_id in store_ids {
-            let results = {
-                let entity_db = store_hub.entity_db_mut(&store_id);
-                entity_db.poll_worker_output()
-            };
-
-            for (processed, was_empty_before, entity_db_add_result) in results {
-                self.finalize_arrow_chunk_ingestion(
-                    store_hub,
-                    egui_ctx,
-                    processed.channel_source.as_ref(),
-                    &processed.store_id,
-                    processed.msg_will_add_new_store,
-                    was_empty_before,
-                    entity_db_add_result,
-                );
-            }
-        }
-
-        // Check if all messages have been ingested after processing worker output
-        // Debug: Always evaluate and log guard conditions
-        let is_tracking = self.rrd_loading_metrics.is_tracking;
-        let all_ingested_is_none = self.rrd_loading_metrics.all_messages_ingested.is_none();
-        let all_channels_closed = self.rx_log.sources().is_empty();
-
-        if self.rrd_loading_metrics.total_messages > 100000 {
-            re_log::debug!(
-                "[process_ingestion_worker_output] Detection guards: is_tracking={}, all_ingested_is_none={}, channels_closed={}, total_msg={}, total_ingested={}",
-                is_tracking,
-                all_ingested_is_none,
-                all_channels_closed,
-                self.rrd_loading_metrics.total_messages,
-                self.rrd_loading_metrics.total_ingested
-            );
-        }
-
-        if is_tracking && all_ingested_is_none {
-            if all_channels_closed && self.rrd_loading_metrics.total_messages > 0 {
-                re_log::debug!(
-                    "Ingestion check: total_msg={}, total_ingested={}",
-                    self.rrd_loading_metrics.total_messages,
-                    self.rrd_loading_metrics.total_ingested
-                );
-            }
-
-            if all_channels_closed
-                && self.rrd_loading_metrics.total_messages > 0
-                && self.rrd_loading_metrics.total_messages
-                    == self.rrd_loading_metrics.total_ingested
-            {
-                re_log::info!(
-                    "✓ All {} messages ingested! Marking ingestion complete.",
-                    self.rrd_loading_metrics.total_ingested
-                );
-                self.rrd_loading_metrics.mark_all_ingested();
-            }
-        } else if self.rrd_loading_metrics.total_messages > 100000 {
-            re_log::debug!(
-                "[process_ingestion_worker_output] Guard conditions failed - skipping detection"
-            );
         }
     }
 

@@ -26,6 +26,9 @@ pub use self::{
     versioned_instance_path::{VersionedInstancePath, VersionedInstancePathHash},
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use self::store_bundle::IngestionWorkerResults;
+
 #[doc(no_inline)]
 pub use re_log_types::{EntityPath, EntityPathPart, TimeInt, Timeline};
 

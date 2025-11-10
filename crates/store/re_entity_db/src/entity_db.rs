@@ -680,30 +680,32 @@ impl EntityDb {
         re_tracing::profile_function!();
 
         // Lazy-init worker on first use
-        if self.ingestion_worker.is_none() {
+        let worker = self.ingestion_worker.get_or_insert_with(|| {
             re_log::debug!("Creating ingestion worker for store {:?}", self.store_id);
-            self.ingestion_worker = Some(crate::ingestion_worker::IngestionWorker::new());
-        }
+            crate::ingestion_worker::IngestionWorker::new()
+        });
 
-        if let Some(worker) = &self.ingestion_worker {
-            worker.submit_arrow_msg_blocking(
-                self.store_id.clone(),
-                arrow_msg,
-                channel_source,
-                msg_will_add_new_store,
-            );
-        }
+        worker.submit_arrow_msg_blocking(
+            self.store_id.clone(),
+            arrow_msg,
+            channel_source,
+            msg_will_add_new_store,
+        );
     }
 
-    /// Poll the background ingestion worker for processed chunks (native only).
+    /// Process pending work from the background ingestion worker (native only).
     ///
-    /// Returns a vector of (`ProcessedChunk`, `was_empty_before`, `StoreEvents`) tuples.
-    /// Each chunk has been successfully added to the store.
+    /// This should be called once per frame to process chunks that have been
+    /// converted by the background worker. The processed chunks are automatically
+    /// added to this `EntityDb`'s store.
     ///
-    /// On native: Returns chunks processed by the background worker
+    /// Returns a vector of (`ProcessedChunk`, `was_empty_before`, `StoreEvents`) tuples
+    /// for each chunk that was successfully added.
+    ///
+    /// On native: Polls and processes chunks from the background worker
     /// On Wasm: This method doesn't exist (compile error if called)
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn poll_worker_output(
+    pub fn on_frame_start(
         &mut self,
     ) -> Vec<(
         crate::ingestion_worker::ProcessedChunk,
