@@ -1,48 +1,53 @@
 use std::ops::RangeInclusive;
 
-use crate::{TimeInt, TimeReal};
+use crate::{NonMinI64, TimeInt, TimeReal};
 
 // ----------------------------------------------------------------------------
 
-/// An absolute time range using [`TimeInt`].
+/// An absolute time range using [`NonMinI64`].
 ///
 /// Can be resolved from [`re_types_core::datatypes::TimeRange`] (which *may* have relative bounds) using a given timeline & cursor.
 ///
-/// Should not include [`TimeInt::STATIC`].
+/// This range is guaranteed to never include [`TimeInt::STATIC`] - it represents only temporal values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct AbsoluteTimeRange {
-    pub min: TimeInt,
-    pub max: TimeInt,
+    pub min: NonMinI64,
+    pub max: NonMinI64,
 }
 
 impl AbsoluteTimeRange {
     /// Contains no time at all.
     pub const EMPTY: Self = Self {
-        min: TimeInt::MAX,
-        max: TimeInt::MIN,
+        min: NonMinI64::MAX,
+        max: NonMinI64::MIN,
     };
 
     /// Contains all time.
     pub const EVERYTHING: Self = Self {
-        min: TimeInt::MIN,
-        max: TimeInt::MAX,
+        min: NonMinI64::MIN,
+        max: NonMinI64::MAX,
     };
 
     /// Creates a new temporal [`AbsoluteTimeRange`].
-    ///
-    /// The returned range is guaranteed to never include [`TimeInt::STATIC`].
     #[inline]
-    pub fn new(min: impl TryInto<TimeInt>, max: impl TryInto<TimeInt>) -> Self {
-        let min = TimeInt::saturated_temporal(min);
-        let max = TimeInt::saturated_temporal(max);
+    pub fn new(min: i64, max: i64) -> Self {
+        Self {
+            min: NonMinI64::saturating_from_i64(min),
+            max: NonMinI64::saturating_from_i64(max),
+        }
+    }
+
+    /// Creates a new [`AbsoluteTimeRange`] from [`NonMinI64`] values.
+    #[inline]
+    pub fn from_non_min(min: NonMinI64, max: NonMinI64) -> Self {
         Self { min, max }
     }
 
-    /// The returned range is guaranteed to never include [`TimeInt::STATIC`].
+    /// Creates a point range (min == max).
     #[inline]
-    pub fn point(time: impl TryInto<TimeInt>) -> Self {
-        let time = TimeInt::saturated_temporal(time);
+    pub fn point(time: i64) -> Self {
+        let time = NonMinI64::saturating_from_i64(time);
         Self {
             min: time,
             max: time,
@@ -50,46 +55,40 @@ impl AbsoluteTimeRange {
     }
 
     #[inline]
-    pub fn min(&self) -> TimeInt {
+    pub fn min(&self) -> NonMinI64 {
         self.min
     }
 
     #[inline]
-    pub fn max(&self) -> TimeInt {
+    pub fn max(&self) -> NonMinI64 {
         self.max
     }
 
     /// Overwrites the start bound of the range.
-    ///
-    /// The resulting range is guaranteed to never include [`TimeInt::STATIC`].
     #[inline]
-    pub fn set_min(&mut self, time: impl TryInto<TimeInt>) {
-        let time = TimeInt::saturated_temporal(time);
-        self.min = time;
+    pub fn set_min(&mut self, time: i64) {
+        self.min = NonMinI64::saturating_from_i64(time);
     }
 
     /// Overwrites the end bound of the range.
-    ///
-    /// The resulting range is guaranteed to never include [`TimeInt::STATIC`].
     #[inline]
-    pub fn set_max(&mut self, time: impl TryInto<TimeInt>) {
-        let time = TimeInt::saturated_temporal(time);
-        self.max = time;
+    pub fn set_max(&mut self, time: i64) {
+        self.max = NonMinI64::saturating_from_i64(time);
     }
 
     /// The amount of time or sequences covered by this range.
     #[inline]
     pub fn abs_length(&self) -> u64 {
-        self.min.as_i64().abs_diff(self.max.as_i64())
+        self.min.get().abs_diff(self.max.get())
     }
 
     #[inline]
-    pub fn center(&self) -> TimeInt {
+    pub fn center(&self) -> NonMinI64 {
         self.min.midpoint(self.max)
     }
 
     #[inline]
-    pub fn contains(&self, time: TimeInt) -> bool {
+    pub fn contains(&self, time: NonMinI64) -> bool {
         self.min <= time && time <= self.max
     }
 
@@ -133,7 +132,7 @@ impl AbsoluteTimeRange {
             std::mem::swap(&mut min, &mut max);
         }
 
-        Self::new(min, max)
+        Self::new(min.0, max.0)
     }
 }
 
@@ -229,6 +228,6 @@ impl From<&AbsoluteTimeRangeF> for RangeInclusive<TimeReal> {
 
 impl From<AbsoluteTimeRange> for AbsoluteTimeRangeF {
     fn from(range: AbsoluteTimeRange) -> Self {
-        Self::new(range.min, range.max)
+        Self::new(range.min.get(), range.max.get())
     }
 }

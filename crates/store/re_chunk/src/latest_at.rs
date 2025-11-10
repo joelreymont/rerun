@@ -1,6 +1,6 @@
 use arrow::array::Array as _;
 
-use re_log_types::{TimeInt, TimelineName};
+use re_log_types::{NonMinI64, TimeInt, TimelineName};
 use re_types_core::ComponentIdentifier;
 
 use crate::{Chunk, RowId};
@@ -13,7 +13,7 @@ use crate::{Chunk, RowId};
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LatestAtQuery {
     timeline: TimelineName,
-    at: TimeInt,
+    at: NonMinI64,
 }
 
 impl std::fmt::Debug for LatestAtQuery {
@@ -26,20 +26,26 @@ impl std::fmt::Debug for LatestAtQuery {
 }
 
 impl LatestAtQuery {
-    /// The returned query is guaranteed to never include [`TimeInt::STATIC`].
+    /// Creates a new [`LatestAtQuery`] from an i64 timestamp/sequence.
     #[inline]
-    pub fn new(timeline: TimelineName, at: impl TryInto<TimeInt>) -> Self {
+    pub fn new(timeline: TimelineName, at: i64) -> Self {
         Self {
             timeline,
-            at: TimeInt::saturated_temporal(at),
+            at: NonMinI64::saturating_from_i64(at),
         }
+    }
+
+    /// Creates a new [`LatestAtQuery`] from a [`NonMinI64`] value.
+    #[inline]
+    pub fn from_non_min(timeline: TimelineName, at: NonMinI64) -> Self {
+        Self { timeline, at }
     }
 
     #[inline]
     pub const fn latest(timeline: TimelineName) -> Self {
         Self {
             timeline,
-            at: TimeInt::MAX,
+            at: NonMinI64::MAX,
         }
     }
 
@@ -49,7 +55,7 @@ impl LatestAtQuery {
     }
 
     #[inline]
-    pub fn at(&self) -> TimeInt {
+    pub fn at(&self) -> NonMinI64 {
         self.at
     }
 }
@@ -129,7 +135,7 @@ impl Chunk {
                 // Temporal, row-sorted, time-sorted chunk
 
                 let i = times
-                    .partition_point(|&time| time <= query.at().as_i64())
+                    .partition_point(|&time| time <= query.at().get())
                     .saturating_sub(1);
 
                 for i in (0..=i).rev() {
@@ -143,7 +149,7 @@ impl Chunk {
             } else {
                 // Temporal, unsorted chunk
 
-                let mut closest_data_time = TimeInt::MIN;
+                let mut closest_data_time = NonMinI64::MIN;
                 let mut closest_row_id = RowId::ZERO;
 
                 for (i, row_id) in self.row_ids().enumerate() {
@@ -151,7 +157,7 @@ impl Chunk {
                         continue;
                     }
 
-                    let data_time = TimeInt::new_temporal(times[i]);
+                    let data_time = NonMinI64::saturating_from_i64(times[i]);
 
                     let is_closer_time = data_time > closest_data_time && data_time <= query.at();
                     let is_same_time_but_closer_row_id =
