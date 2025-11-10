@@ -36,7 +36,7 @@ pub fn viewer_harness(options: &HarnessOptions) -> Harness<'static, App> {
                     ..Default::default()
                 },
                 cc,
-                Some(re_redap_client::ConnectionRegistry::new_without_stored_credentials()),
+                None,
                 AsyncRuntimeHandle::from_current_tokio_runtime_or_wasmbindgen()
                     .expect("Failed to create AsyncRuntimeHandle"),
             );

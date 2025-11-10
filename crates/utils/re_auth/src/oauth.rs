@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Jwt;
@@ -10,6 +12,7 @@ mod storage;
 /// during network transit.
 const SOFT_EXPIRE_SECS: i64 = 60;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) static OAUTH_CLIENT_ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     std::env::var("RERUN_OAUTH_CLIENT_ID")
         .ok()
@@ -74,7 +77,8 @@ pub async fn refresh_credentials(
     );
 
     let response = api::refresh(&credentials.refresh_token).await?;
-    let credentials = Credentials::from_auth_response(response)?
+    let credentials = Credentials::from_auth_response(response)?;
+    let credentials = credentials
         .ensure_stored()
         .map_err(|err| CredentialsRefreshError::Store(err.0))?;
     re_log::debug!("credentials refreshed successfully");
@@ -185,7 +189,7 @@ pub struct Credentials {
     access_token: AccessToken,
 }
 
-pub struct InMemoryCredentials(Credentials);
+pub(crate) struct InMemoryCredentials(Credentials);
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to store credentials: {0}")]
@@ -203,13 +207,12 @@ impl Credentials {
     /// Deserializes credentials from an authentication response.
     ///
     /// Assumes the credentials are valid and not expired.
-    ///
-    /// The authentication response must come from a trusted source, such
-    /// as the authentication API.
-    pub fn from_auth_response(
-        res: api::RefreshResponse,
+    pub(crate) fn from_auth_response(
+        res: api::AuthenticationResponse,
     ) -> Result<InMemoryCredentials, MalformedTokenError> {
-        let access_token = AccessToken::unverified(Jwt(res.access_token))?;
+        // SAFETY: The token comes from a trusted source, which is the authentication API.
+        #[expect(unsafe_code)]
+        let access_token = unsafe { AccessToken::unverified(Jwt(res.access_token))? };
         Ok(InMemoryCredentials(Self {
             user: res.user,
             refresh_token: RefreshToken(res.refresh_token),
@@ -231,6 +234,7 @@ impl Credentials {
 pub struct User {
     pub id: String,
     pub email: String,
+    pub metadata: HashMap<String, String>,
 }
 
 /// An access token which was valid at some point in the past.
@@ -265,8 +269,13 @@ impl AccessToken {
 
     /// Construct an [`AccessToken`] without verifying it.
     ///
-    /// The token should come from a trusted source, like the Rerun auth API.
-    pub(crate) fn unverified(jwt: Jwt) -> Result<Self, MalformedTokenError> {
+    /// ## Safety
+    ///
+    /// - The token should come from a trusted source, like the Rerun auth API.
+    // Note: Misusing this will not cause UB, but we're still marking it unsafe
+    // to ensure it is not used lightly.
+    #[expect(unsafe_code)]
+    pub(crate) unsafe fn unverified(jwt: Jwt) -> Result<Self, MalformedTokenError> {
         use base64::prelude::*;
 
         let (_header, rest) = jwt

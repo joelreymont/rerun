@@ -225,6 +225,7 @@ impl TestContext {
             component_ui_registry,
             component_fallback_registry,
             reflection,
+            // TODO(jan): We don't use CLI credentials in tests, it would be nice to test at some point.
             connection_registry:
                 re_redap_client::ConnectionRegistry::new_without_stored_credentials(),
 
@@ -715,19 +716,24 @@ impl TestContext {
                 } => {
                     self.with_blueprint_ctx(|blueprint_ctx, hub| {
                         let mut time_ctrl = self.time_ctrl.write();
-                        let times_per_timeline = hub
+                        let store = hub
                             .store_bundle()
                             .get(&store_id)
-                            .expect("Invalid store id in `SystemCommand::TimeControlCommands`")
-                            .times_per_timeline();
+                            .expect("Invalid store id in `SystemCommand::TimeControlCommands`");
+                        let timelines = store.timelines();
 
                         let blueprint_ctx =
                             Some(&blueprint_ctx).filter(|_| store_id.is_recording());
 
+                        let timeline_times = re_viewer_context::TimelineTimes::new(
+                            &timelines,
+                            store.time_histogram_per_timeline(),
+                        );
+
                         // We can ignore the response in the test context.
                         let res = time_ctrl.handle_time_commands(
                             blueprint_ctx,
-                            times_per_timeline,
+                            &timeline_times,
                             &time_commands,
                         );
 

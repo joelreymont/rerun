@@ -395,9 +395,7 @@ fn compute_stats(app: bool, msg: &Msg) -> anyhow::Result<Option<ChunkStats>> {
             let schema = decoded.batch.schema();
 
             let entity_path = {
-                let entity_path = schema
-                    .metadata()
-                    .get(re_sorbet::metadata::SORBET_ENTITY_PATH);
+                let entity_path = schema.metadata().get("rerun:entity_path");
                 let entity_path =
                     entity_path.or_else(|| schema.metadata().get("rerun.entity_path"));
                 entity_path.map(ToOwned::to_owned).unwrap_or_default()
@@ -418,11 +416,7 @@ fn compute_stats(app: bool, msg: &Msg) -> anyhow::Result<Option<ChunkStats>> {
                 .fields
                 .iter()
                 .filter(|&field| {
-                    field
-                        .metadata()
-                        .get(re_sorbet::metadata::RERUN_KIND)
-                        .map(|s| s.as_str())
-                        == Some("index")
+                    field.metadata().get("rerun:kind").map(|s| s.as_str()) == Some("index")
                         || field.metadata().get("rerun.kind").map(|s| s.as_str()) == Some("index")
                 })
                 .map(|field| field.name().to_owned())
@@ -433,11 +427,7 @@ fn compute_stats(app: bool, msg: &Msg) -> anyhow::Result<Option<ChunkStats>> {
                 .fields
                 .iter()
                 .filter(|&field| {
-                    field
-                        .metadata()
-                        .get(re_sorbet::metadata::RERUN_KIND)
-                        .map(|s| s.as_str())
-                        == Some("data")
+                    field.metadata().get("rerun:kind").map(|s| s.as_str()) == Some("data")
                         || field.metadata().get("rerun.kind").map(|s| s.as_str()) == Some("data")
                 })
                 .map(|field| field.name().to_owned())

@@ -232,6 +232,31 @@ impl Int64Histogram {
             },
         }
     }
+
+    /// Find the next key greater than the given time.
+    ///
+    /// Returns `None` if no such key exists (including when the histogram is empty).
+    pub fn next_key_after(&self, time: i64) -> Option<i64> {
+        // Use cutoff_size=1 to get individual keys
+        self.range(
+            (std::ops::Bound::Excluded(time), std::ops::Bound::Unbounded),
+            1,
+        )
+        .next()
+        .map(|(range, _)| range.min)
+    }
+
+    /// Find the previous key less than the given time.
+    ///
+    /// Returns `None` if no such key exists (including when the histogram is empty).
+    ///
+    /// This is an O(log n) operation that efficiently traverses the trie structure.
+    pub fn prev_key(&self, time: i64) -> Option<i64> {
+        let time_u64 = u64_key_from_i64_key(time);
+        self.root
+            .max_key_before(0, ROOT_LEVEL, time_u64)
+            .map(i64_key_from_u64_key)
+    }
 }
 
 /// An iterator over an [`Int64Histogram`].
@@ -404,6 +429,18 @@ impl Node {
         }
     }
 
+    /// Find the maximum key strictly less than the given time.
+    ///
+    /// This is an O(log n) operation that traverses the trie structure,
+    /// much faster than iterating through all keys.
+    fn max_key_before(&self, my_addr: u64, my_level: Level, time: u64) -> Option<u64> {
+        match self {
+            Self::BranchNode(node) => node.max_key_before(my_addr, my_level, time),
+            Self::SparseLeaf(sparse) => sparse.max_key_before(time),
+            Self::DenseLeaf(dense) => dense.max_key_before(my_addr, time),
+        }
+    }
+
     fn range_count(&self, my_addr: u64, my_level: Level, range: RangeU64) -> u64 {
         match self {
             Self::BranchNode(node) => node.range_count(my_addr, my_level, range),
@@ -509,6 +546,35 @@ impl BranchNode {
                 && let Some(max_key) = child.max_key(child_addr, child_level)
             {
                 return Some(max_key);
+            }
+        }
+        None
+    }
+
+    fn max_key_before(&self, my_addr: u64, my_level: Level, time: u64) -> Option<u64> {
+        debug_assert!(my_level != BOTTOM_LEVEL);
+
+        let (child_level, child_size) = child_level_and_size(my_level);
+
+        // Iterate from right to left (highest to lowest addresses)
+        for ci in (0..NUM_CHILDREN_IN_NODE).rev() {
+            if let Some(child) = &self.children[ci as usize] {
+                let child_addr = my_addr + ci * child_size;
+                // avoid overflow when child_size spans the u64::MAX boundary
+                let child_max_addr = child_addr + (child_size - 1);
+
+                if child_max_addr < time {
+                    // Entire child range is before time, so return its max key
+                    // This is the key optimization: O(log n) instead of iterating all keys
+                    return child.max_key(child_addr, child_level);
+                } else if child_addr < time {
+                    // Time falls within this child's range, recursively search
+                    if let Some(key) = child.max_key_before(child_addr, child_level, time) {
+                        return Some(key);
+                    }
+                    // Otherwise continue searching lower children
+                }
+                // If time <= child_addr, this entire child is >= time, so skip it
             }
         }
         None
@@ -639,6 +705,11 @@ impl SparseLeaf {
         self.addrs.last().copied()
     }
 
+    fn max_key_before(&self, time: u64) -> Option<u64> {
+        // Addresses are sorted, so iterate backwards to find the largest one < time
+        self.addrs.iter().rev().find(|&&addr| addr < time).copied()
+    }
+
     fn range_count(&self, range: RangeU64) -> u64 {
         let mut total = 0;
         for (key, count) in self.addrs.iter().zip(&self.counts) {
@@ -704,6 +775,24 @@ impl DenseLeaf {
     fn max_key(&self, my_addr: u64) -> Option<u64> {
         for (i, count) in self.counts.iter().enumerate().rev() {
             if *count > 0 {
+                return Some(my_addr + i as u64);
+            }
+        }
+        None
+    }
+
+    fn max_key_before(&self, my_addr: u64, time: u64) -> Option<u64> {
+        // We need to find max i where my_addr + i < time and counts[i] > 0
+        // So i < time - my_addr
+        if time <= my_addr {
+            return None;
+        }
+
+        let max_i = ((time - my_addr - 1).min(NUM_CHILDREN_IN_DENSE - 1)) as usize;
+
+        // Iterate backwards from max_i to find the first non-zero count
+        for i in (0..=max_i).rev() {
+            if self.counts[i] > 0 {
                 return Some(my_addr + i as u64);
             }
         }
@@ -1072,5 +1161,94 @@ mod tests {
 
         assert_eq!((set.min_key(), set.max_key()), (None, None));
         assert_eq!(set.range(.., 1).count(), 0);
+    }
+
+    #[test]
+    fn test_next_key_after() {
+        let mut hist = Int64Histogram::default();
+
+        // Empty histogram
+        assert_eq!(hist.next_key_after(0), None);
+
+        // Single key
+        hist.increment(10, 1);
+        assert_eq!(hist.next_key_after(5), Some(10));
+        assert_eq!(hist.next_key_after(10), None); // no key > 10
+        assert_eq!(hist.next_key_after(15), None); // no key > 15
+
+        // Multiple keys
+        hist.increment(20, 1);
+        hist.increment(30, 1);
+        assert_eq!(hist.next_key_after(5), Some(10));
+        assert_eq!(hist.next_key_after(10), Some(20));
+        assert_eq!(hist.next_key_after(15), Some(20));
+        assert_eq!(hist.next_key_after(20), Some(30));
+        assert_eq!(hist.next_key_after(25), Some(30));
+        assert_eq!(hist.next_key_after(30), None); // no key > 30
+        assert_eq!(hist.next_key_after(35), None); // no key > 35
+
+        // Sparse keys
+        hist = Int64Histogram::default();
+        hist.increment(1000, 1);
+        hist.increment(2000, 1);
+        hist.increment(3000, 1);
+        assert_eq!(hist.next_key_after(500), Some(1000));
+        assert_eq!(hist.next_key_after(1000), Some(2000));
+        assert_eq!(hist.next_key_after(1500), Some(2000));
+        assert_eq!(hist.next_key_after(2000), Some(3000));
+        assert_eq!(hist.next_key_after(2500), Some(3000));
+        assert_eq!(hist.next_key_after(3500), None); // no key > 3500
+    }
+
+    #[test]
+    fn test_prev_key_before() {
+        let mut hist = Int64Histogram::default();
+
+        // Empty histogram
+        assert_eq!(hist.prev_key(0), None);
+
+        // Single key
+        hist.increment(10, 1);
+        assert_eq!(hist.prev_key(15), Some(10));
+        assert_eq!(hist.prev_key(10), None); // no key < 10
+        assert_eq!(hist.prev_key(5), None); // no key < 5
+
+        // Multiple keys
+        hist.increment(20, 1);
+        hist.increment(30, 1);
+        assert_eq!(hist.prev_key(35), Some(30));
+        assert_eq!(hist.prev_key(30), Some(20));
+        assert_eq!(hist.prev_key(30), Some(20));
+        assert_eq!(hist.prev_key(25), Some(20));
+        assert_eq!(hist.prev_key(20), Some(10));
+        assert_eq!(hist.prev_key(15), Some(10));
+        assert_eq!(hist.prev_key(10), None); // no key < 10
+        assert_eq!(hist.prev_key(5), None); // no key < 5
+
+        // Sparse keys
+        hist = Int64Histogram::default();
+        hist.increment(1000, 1);
+        hist.increment(2000, 1);
+        hist.increment(3000, 1);
+        assert_eq!(hist.prev_key(3500), Some(3000));
+        assert_eq!(hist.prev_key(3000), Some(2000));
+        assert_eq!(hist.prev_key(2500), Some(2000));
+        assert_eq!(hist.prev_key(2000), Some(1000));
+        assert_eq!(hist.prev_key(1500), Some(1000));
+        assert_eq!(hist.prev_key(1000), None);
+        assert_eq!(hist.prev_key(500), None); // no key < 500
+
+        // Fast path: max_key < time
+        assert_eq!(hist.max_key(), Some(3000));
+        assert_eq!(hist.prev_key(5000), Some(3000));
+
+        // Dense histogram with many keys (tests optimization)
+        hist = Int64Histogram::default();
+        for i in 0..1000 {
+            hist.increment(i, 1);
+        }
+        assert_eq!(hist.prev_key(500), Some(499));
+        assert_eq!(hist.prev_key(1000), Some(999));
+        assert_eq!(hist.prev_key(0), None); // no key < 0
     }
 }

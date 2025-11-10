@@ -59,10 +59,7 @@ impl SorbetSchema {
     }
 
     pub fn entity_path_metadata(entity_path: &EntityPath) -> (String, String) {
-        (
-            crate::metadata::SORBET_ENTITY_PATH.to_owned(),
-            entity_path.to_string(),
-        )
+        ("rerun:entity_path".to_owned(), entity_path.to_string())
     }
 
     pub fn partition_id_metadata(partition_id: impl AsRef<str>) -> (String, String) {
@@ -139,7 +136,7 @@ impl SorbetSchema {
         let ArrowSchema { metadata, fields } = arrow_schema;
 
         let entity_path = metadata
-            .get(crate::metadata::SORBET_ENTITY_PATH)
+            .get("rerun:entity_path")
             .map(|s| EntityPath::parse_forgiving(s));
 
         let columns = SorbetColumnDescriptors::try_from_arrow_fields(entity_path.as_ref(), fields)?;

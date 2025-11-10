@@ -91,7 +91,7 @@ pub use self::{
     tensor::{ImageStats, TensorStats},
     time_control::{
         TIME_PANEL_PATH, TimeControl, TimeControlCommand, TimeControlResponse, TimeView,
-        time_panel_blueprint_entity_path,
+        TimelineTimes, time_panel_blueprint_entity_path,
     },
     typed_entity_collections::{
         IndicatedEntities, MaybeVisualizableEntities, PerVisualizer, VisualizableEntities,

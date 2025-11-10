@@ -64,15 +64,13 @@ impl PyCatalogClientInternal {
         let connection_registry =
             re_redap_client::ConnectionRegistry::new_with_stored_credentials();
 
-        let credentials = match token
+        let token = token
             .map(TryFrom::try_from)
             .transpose()
-            .map_err(to_py_err)?
-        {
-            Some(token) => re_redap_client::Credentials::Token(token),
-            None => re_redap_client::Credentials::Stored,
-        };
-        connection_registry.set_credentials(&origin, credentials);
+            .map_err(to_py_err)?;
+        if let Some(token) = token {
+            connection_registry.set_token(&origin, token);
+        }
 
         let connection = ConnectionHandle::new(connection_registry, origin.clone());
 

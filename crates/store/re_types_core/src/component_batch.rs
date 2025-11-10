@@ -300,6 +300,17 @@ impl SerializedComponentBatch {
 // all things related to tags up and running so we can gather learnings.
 // This is only used on the archetype deserialization path, which isn't ever used outside of tests anyway.
 
+// TODO(cmc): we really shouldn't be duplicating these.
+
+/// The key used to identify the [`ArchetypeName`] in field-level metadata.
+const FIELD_METADATA_KEY_ARCHETYPE_NAME: &str = "rerun:archetype";
+
+/// The [`crate::ComponentIdentifier`] in field-level metadata.
+const FIELD_METADATA_KEY_COMPONENT: &str = "rerun:component";
+
+/// The key used to identify the [`ComponentType`] in field-level metadata.
+const FIELD_METADATA_KEY_COMPONENT_TYPE: &str = "rerun:component_type";
+
 impl From<&SerializedComponentBatch> for arrow::datatypes::Field {
     #[inline]
     fn from(batch: &SerializedComponentBatch) -> Self {
@@ -312,17 +323,17 @@ impl From<&SerializedComponentBatch> for arrow::datatypes::Field {
             [
                 batch.descriptor.archetype.map(|name| {
                     (
-                        crate::FIELD_METADATA_KEY_ARCHETYPE.to_owned(),
+                        FIELD_METADATA_KEY_ARCHETYPE_NAME.to_owned(),
                         name.to_string(),
                     )
                 }),
                 Some((
-                    crate::FIELD_METADATA_KEY_COMPONENT.to_owned(),
+                    FIELD_METADATA_KEY_COMPONENT.to_owned(),
                     batch.descriptor.component.to_string(),
                 )),
                 batch.descriptor.component_type.map(|name| {
                     (
-                        crate::FIELD_METADATA_KEY_COMPONENT_TYPE.to_owned(),
+                        FIELD_METADATA_KEY_COMPONENT_TYPE.to_owned(),
                         name.to_string(),
                     )
                 }),
