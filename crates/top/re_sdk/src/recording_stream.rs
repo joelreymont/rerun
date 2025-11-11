@@ -1827,7 +1827,11 @@ impl RecordingStream {
     /// will end up in the new sink.
     ///
     /// If the batcher's configuration has not been set explicitly or by environment variables,
-    /// this will change the batcher configuration to the sink's default configuration.
+    /// this will change the batcher configuration to the sink's default configuration, with one
+    /// important limitation: **channel bounds** (`max_commands_in_flight`, `max_chunks_in_flight`)
+    /// **cannot be changed** after the batcher is created. If the new sink's default configuration
+    /// specifies different channel bounds than the current batcher, those changes will not take effect.
+    /// To work around this, create a new `RecordingStream` with the desired sink.
     ///
     /// ## Data loss
     ///
@@ -1857,8 +1861,17 @@ impl RecordingStream {
 
             // Update the batcher's configuration if it's sink-dependent.
             if inner.sink_dependent_batcher_config {
-                let batcher_config = resolve_batcher_config(None, &*new_sink);
-                inner.batcher.update_config(batcher_config);
+                let new_batcher_config = resolve_batcher_config(None, &*new_sink);
+
+                // Note: The batcher's update_config will log a warning if channel bounds differ,
+                // but we add context here about what this means for sink switching.
+                re_log::debug!(
+                    "Updating batcher config for new sink. Note: channel bounds (max_commands_in_flight, \
+                     max_chunks_in_flight) cannot be changed after batcher creation. If the new sink \
+                     requires different bounds, they will not be applied."
+                );
+
+                inner.batcher.update_config(new_batcher_config);
             }
 
             // Swap the sink, which will internally make sure to re-ingest the backlog if needed
@@ -1948,6 +1961,11 @@ impl RecordingStream {
                 .map_err(|err| match err {
                     BatcherFlushError::Closed => SinkFlushError::failed(err.to_string()),
                     BatcherFlushError::Timeout => SinkFlushError::Timeout,
+                    BatcherFlushError::DataLoss => SinkFlushError::failed(err.to_string()),
+                    BatcherFlushError::CommandChannelFull => {
+                        // This shouldn't happen with flush_blocking, but handle it anyway
+                        SinkFlushError::failed(err.to_string())
+                    }
                 })?;
 
             // 2. Drain all pending chunks from the batcher's channel _before_ any other future command

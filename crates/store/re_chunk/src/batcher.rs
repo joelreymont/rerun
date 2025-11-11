@@ -1,6 +1,9 @@
 use std::{
     hash::{Hash as _, Hasher as _},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -25,6 +28,12 @@ pub enum BatcherFlushError {
 
     #[error("Batcher flush timed out - not all messages were sent.")]
     Timeout,
+
+    #[error("Data was irretrievably lost - the batcher dropped messages due to full channels or shutdown.")]
+    DataLoss,
+
+    #[error("Failed to send flush command - channel is full. Try using flush_blocking instead.")]
+    CommandChannelFull,
 }
 
 /// Errors that can occur when creating/manipulating a [`ChunkBatcher`].
@@ -126,6 +135,11 @@ impl std::fmt::Debug for BatcherHooks {
 
 /// Defines the different thresholds of the associated [`ChunkBatcher`].
 ///
+/// **Important:** Once a [`ChunkBatcher`] is created, the `max_commands_in_flight` and
+/// `max_chunks_in_flight` values cannot be changed via [`ChunkBatcher::update_config`].
+/// These bounds determine the underlying channel types (bounded vs unbounded) which are
+/// fixed at creation time.
+///
 /// See [`Self::default`] and [`Self::from_env`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChunkBatcherConfig {
@@ -151,14 +165,22 @@ pub struct ChunkBatcherConfig {
 
     /// Size of the internal channel of commands.
     ///
-    /// Unbounded if left unspecified.
-    /// Once a batcher is created, this property cannot be changed.
+    /// Unbounded if left unspecified (`None`).
+    ///
+    /// **Important:** Once a batcher is created, this property cannot be changed via
+    /// [`ChunkBatcher::update_config`]. The channel type (bounded vs unbounded) is fixed
+    /// at creation time. If you need to change this, create a new [`ChunkBatcher`].
+    ///
+    /// When using bounded channels, commands may be dropped if the channel fills up,
+    /// which will set the data loss flag and cause future flush operations to return
+    /// [`BatcherFlushError::DataLoss`].
     pub max_commands_in_flight: Option<u64>,
 
     /// Size of the internal channel of [`Chunk`]s.
     ///
-    /// Unbounded if left unspecified.
-    /// Once a batcher is created, this property cannot be changed.
+    /// Unbounded if left unspecified (`None`).
+    ///
+    /// Save caveat applies to changing this propert after the batcher is created 
     pub max_chunks_in_flight: Option<u64>,
 }
 
@@ -180,9 +202,25 @@ impl ChunkBatcherConfig {
     };
 
     /// Low-latency configuration, preferred when streaming directly to a viewer.
+    ///
+    /// This configuration uses bounded channels to prevent unbounded memory growth when
+    /// the sink cannot keep up with the data rate (e.g., slow network, disconnected viewer).
+    /// The bounds provide backpressure - if channels fill up, data will be dropped with
+    /// warnings logged. This is a trade-off: we prevent memory exhaustion but accept potential
+    /// data loss under extreme conditions.
+    ///
+    /// **Channel Bounds:** 512 chunks provides ~15-20 seconds of buffering at typical rates
+    /// (30Hz images), balancing memory protection with tolerance for connection delays.
+    ///
+    /// **Note:** If you need unbounded buffering (e.g., for file sinks), use [`Self::DEFAULT`]
+    /// or explicitly set `max_commands_in_flight` and `max_chunks_in_flight` to `None`.
     pub const LOW_LATENCY: Self = Self {
         flush_tick: Duration::from_millis(8), // We want it fast enough for 60 Hz for real time camera feel
-        ..Self::DEFAULT
+        flush_num_bytes: 1024 * 1024, // 1 MiB
+        flush_num_rows: u64::MAX,
+        chunk_max_rows_if_unsorted: 256,
+        max_commands_in_flight: Some(512),
+        max_chunks_in_flight: Some(512),
     };
 
     /// Always flushes ASAP.
@@ -393,6 +431,9 @@ struct ChunkBatcherInner {
     // NOTE: Option so we can make shutdown non-blocking even with bounded channels.
     rx_chunks: Option<Receiver<Chunk>>,
     cmds_to_chunks_handle: Option<std::thread::JoinHandle<()>>,
+    /// Set to true if data was lost due to full channels or premature shutdown.
+    /// Once set, all flush operations will return DataLoss error.
+    data_lost: Arc<AtomicBool>,
 }
 
 impl Drop for ChunkBatcherInner {
@@ -402,7 +443,11 @@ impl Drop for ChunkBatcherInner {
         if let Some(rx_chunks) = self.rx_chunks.take()
             && !rx_chunks.is_empty()
         {
-            re_log::warn!("Dropping data");
+            re_log::warn!(
+                "Dropping data during batcher shutdown - {} chunks will be lost",
+                rx_chunks.len()
+            );
+            self.data_lost.store(true, Ordering::Release);
         }
 
         // NOTE: The command channel is private, if we're here, nothing is currently capable of
@@ -467,6 +512,7 @@ impl ChunkBatcher {
             tx_cmds,
             rx_chunks: Some(rx_chunks),
             cmds_to_chunks_handle: Some(cmds_to_chunks_handle),
+            data_lost: Arc::new(AtomicBool::new(false)),
         };
 
         Ok(Self {
@@ -494,9 +540,13 @@ impl ChunkBatcher {
     ///
     /// This does **not** wait for the flush to propagate (see [`Self::flush_blocking`]).
     /// See [`ChunkBatcher`] docs for ordering semantics and multithreading guarantees.
+    ///
+    /// Returns an error if:
+    /// - Data was previously lost due to full channels or shutdown ([`BatcherFlushError::DataLoss`])
+    /// - The command channel is full and cannot accept the flush command ([`BatcherFlushError::CommandChannelFull`])
     #[inline]
-    pub fn flush_async(&self) {
-        self.inner.flush_async();
+    pub fn flush_async(&self) -> Result<(), BatcherFlushError> {
+        self.inner.flush_async()
     }
 
     /// Initiates a flush the batching pipeline and waits for it to propagate.
@@ -536,13 +586,33 @@ impl ChunkBatcherInner {
         self.send_cmd(Command::AppendRow(entity_path, row));
     }
 
-    fn flush_async(&self) {
+    fn flush_async(&self) -> Result<(), BatcherFlushError> {
+        // Check if data was already lost
+        if self.data_lost.load(Ordering::Acquire) {
+            return Err(BatcherFlushError::DataLoss);
+        }
+
         let (flush_cmd, _) = Command::flush();
-        self.send_cmd(flush_cmd);
+
+        // Use try_send to make this truly non-blocking
+        match self.tx_cmds.try_send(flush_cmd) {
+            Ok(()) => Ok(()),
+            Err(crossbeam::channel::TrySendError::Full(_)) => {
+                Err(BatcherFlushError::CommandChannelFull)
+            }
+            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                Err(BatcherFlushError::Closed)
+            }
+        }
     }
 
     fn flush_blocking(&self, timeout: Duration) -> Result<(), BatcherFlushError> {
         use crossbeam::channel::RecvTimeoutError;
+
+        // Check if data was already lost
+        if self.data_lost.load(Ordering::Acquire) {
+            return Err(BatcherFlushError::DataLoss);
+        }
 
         let (flush_cmd, on_done) = Command::flush();
         self.send_cmd(flush_cmd);
@@ -720,8 +790,18 @@ fn batching_thread(
                         // Warn if properties changed that we can't change here.
                         if config.max_commands_in_flight != new_config.max_commands_in_flight ||
                             config.max_chunks_in_flight != new_config.max_chunks_in_flight {
-                            re_log::warn!("Cannot change max commands/chunks in flight after batcher has been created. Previous max commands/chunks: {:?}/{:?}, new max commands/chunks: {:?}/{:?}",
-                                            config.max_commands_in_flight, config.max_chunks_in_flight, new_config.max_commands_in_flight, new_config.max_chunks_in_flight);
+                            re_log::warn!(
+                                "Cannot change max commands/chunks in flight after batcher has been created. \
+                                 Channel bounds are fixed at batcher creation time because they determine the \
+                                 underlying channel types (bounded vs unbounded). \
+                                 Current: commands={:?}, chunks={:?}. \
+                                 Requested: commands={:?}, chunks={:?}. \
+                                 To use different bounds, create a new ChunkBatcher or RecordingStream.",
+                                config.max_commands_in_flight,
+                                config.max_chunks_in_flight,
+                                new_config.max_commands_in_flight,
+                                new_config.max_chunks_in_flight
+                            );
                         }
 
                         re_log::trace!("Updated batcher config: {:?}", new_config);

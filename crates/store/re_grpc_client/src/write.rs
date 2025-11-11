@@ -6,7 +6,7 @@ use std::{
 
 use tokio::{
     runtime,
-    sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{self, Receiver, Sender},
 };
 use tonic::transport::Endpoint;
 use web_time::Instant;
@@ -122,14 +122,18 @@ pub struct Client {
     uri: ProxyUri,
     options: Options,
     thread: Option<JoinHandle<()>>,
-    cmd_tx: UnboundedSender<Cmd>,
+    cmd_tx: Sender<Cmd>,
     shutdown_tx: Sender<()>,
     status: Arc<AtomicCell<ClientConnectionState>>,
 }
 
 impl Client {
     pub fn new(uri: ProxyUri, options: Options) -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        // Bound the channel to prevent unlimited memory growth when network is slow.
+        // 1024 messages provides ~30 seconds of buffering at typical rates (30Hz images)
+        // while still preventing memory exhaustion. Larger buffer reduces premature drops
+        // during connection establishment.
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         let status = Arc::new(AtomicCell::new(ClientConnectionState::Connecting {
@@ -168,7 +172,22 @@ impl Client {
     }
 
     pub fn send(&self, msg: LogMsg) {
-        self.cmd_tx.send(Cmd::LogMsg(msg)).ok();
+        // Use try_send for non-blocking behavior. If the channel is full, we drop the message
+        // and log a warning. This provides backpressure and prevents unbounded memory growth.
+        if let Err(err) = self.cmd_tx.try_send(Cmd::LogMsg(msg)) {
+            match err {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    re_log::warn_once!(
+                        "gRPC send buffer is full (1024 messages). Dropping log messages. \
+                         This indicates the viewer is unreachable or network is too slow. \
+                         Data loss is occurring."
+                    );
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    // Channel closed, shutdown in progress - silently drop
+                }
+            }
+        }
     }
 
     /// Whether the client is connected to a remote server.
@@ -192,18 +211,62 @@ impl Client {
         re_tracing::profile_function!();
 
         let (flush_done_tx, flush_done_rx) = crossbeam::channel::bounded(1); // oneshot
-        if self
-            .cmd_tx
-            .send(Cmd::Flush {
-                on_done: flush_done_tx,
-            })
-            .is_err()
-        {
-            return Err(GrpcFlushError::from_status(self.uri.clone(), self.status()));
-        }
+
+        // Try to send the flush command with timeout to avoid deadlock.
+        // If the channel is full (e.g., during connection establishment), we retry
+        // until timeout instead of blocking indefinitely.
+        let flush_cmd = Cmd::Flush {
+            on_done: flush_done_tx,
+        };
 
         let start = std::time::Instant::now();
+        let mut flush_cmd = Some(flush_cmd);
 
+        loop {
+            match self.cmd_tx.try_send(flush_cmd.take().unwrap()) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                    flush_cmd = Some(cmd);
+
+                    // Check if we've exceeded timeout
+                    if start.elapsed() > timeout {
+                        return Err(GrpcFlushError::Timeout {
+                            num_sec: start.elapsed().as_secs_f32(),
+                        });
+                    }
+
+                    // Check connection status
+                    match self.status() {
+                        ClientConnectionState::Connecting { started } => {
+                            if self.options.connect_timeout_on_flush < started.elapsed() {
+                                return Err(GrpcFlushError::FailedToConnect {
+                                    uri: self.uri.clone(),
+                                    duration_sec: started.elapsed().as_secs_f32(),
+                                });
+                            }
+                        }
+                        ClientConnectionState::Disconnected(_) => {
+                            return Err(GrpcFlushError::from_status(
+                                self.uri.clone(),
+                                self.status(),
+                            ));
+                        }
+                        ClientConnectionState::Connected => {
+                            // Channel full but connected - keep retrying
+                        }
+                    }
+
+                    // Brief sleep before retry to avoid busy-waiting
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return Err(GrpcFlushError::from_status(self.uri.clone(), self.status()));
+                }
+            }
+        }
+
+        // Continue using the same timer for the waiting phase to ensure
+        // the overall timeout bounds the entire flush operation
         let very_slow = std::time::Duration::from_secs(10);
         let mut has_emitted_slow_warning = false;
 
@@ -309,7 +372,7 @@ impl Drop for Client {
 
 async fn message_proxy_client(
     uri: ProxyUri,
-    mut cmd_rx: UnboundedReceiver<Cmd>,
+    mut cmd_rx: Receiver<Cmd>,
     mut shutdown_rx: Receiver<()>,
     compression: Compression,
     status: Arc<AtomicCell<ClientConnectionState>>,

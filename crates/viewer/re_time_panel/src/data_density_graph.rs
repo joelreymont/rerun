@@ -58,7 +58,12 @@ impl DataDensityGraphPainter {
             egui::emath::exponential_smooth_factor(0.90, 0.1, dt),
         );
 
-        if (self.previous_max_density - new).abs() > 0.01 {
+        // Don't request repaints unless both:
+        // 1. We have meaningful time progression (dt >= 1/60s = 0.0167)
+        // 2. The change is significant enough to be visible
+        // This prevents infinite repaint loops in test environments (like egui_kittest)
+        // where dt is often a small fixed value (e.g., 0.01666) that causes slow convergence.
+        if dt >= 0.0167 && (self.previous_max_density - new).abs() > 0.01 {
             egui_ctx.request_repaint();
         }
 

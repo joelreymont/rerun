@@ -1643,6 +1643,8 @@ fn flush(py: Python<'_>, timeout_sec: f32, recording: Option<&PyRecordingStream>
     // Release the GIL in case any flushing behavior needs to cleanup a python object.
     py.allow_threads(|| -> PyResult<()> {
         if timeout_sec == 0.0 {
+            // Non-blocking flush - use flush_async
+            // Note: This may now fail if the command channel is full or data was lost
             recording
                 .flush_async()
                 .map_err(|err: SinkFlushError| PyRuntimeError::new_err(err.to_string()))?;
